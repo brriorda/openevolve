@@ -2,6 +2,7 @@
 Configuration handling for OpenEvolve
 """
 
+import copy
 import os
 import re
 from dataclasses import asdict, dataclass, field
@@ -413,6 +414,27 @@ class EvolutionTraceConfig:
 
 
 @dataclass
+class RejectionMemoryConfig:
+    """Settings shared by rejection-memory policies.
+
+    The default ``artifact_low_score`` policy preserves legacy admission. For
+    example, ``RejectionMemoryConfig(store="in_memory")`` keeps attempt records
+    only for the lifetime of the current controller process.
+    """
+
+    policy: str = "artifact_low_score"
+    penalty_score: float = 0.0
+    store: str = "run_directory"
+    max_rationale_bytes: int = 4096
+    max_evidence_bytes: int = 4096
+    security_filter: bool = True
+    feedback_recent_k: int = 1
+    repair_max_attempts: int = 1
+    repair_models: List[str] = field(default_factory=list)
+    repair_diff_based: bool = False
+
+
+@dataclass
 class Config:
     """Master configuration for OpenEvolve"""
 
@@ -431,6 +453,7 @@ class Config:
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     evaluator: EvaluatorConfig = field(default_factory=EvaluatorConfig)
     evolution_trace: EvolutionTraceConfig = field(default_factory=EvolutionTraceConfig)
+    rejection_memory: RejectionMemoryConfig = field(default_factory=RejectionMemoryConfig)
 
     # Evolution settings
     diff_based_evolution: bool = True
@@ -463,6 +486,8 @@ class Config:
 
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> "Config":
+        """Build a validated config object from a mapping without mutating caller-owned input."""
+        config_dict = copy.deepcopy(config_dict)
         if "diff_pattern" in config_dict:
             try:
                 re.compile(config_dict["diff_pattern"])
@@ -494,6 +519,17 @@ class Config:
                 "prompt.programs_as_changes_description=true requires diff_based_evolution=true "
                 "(full rewrites cannot reliably update code and changes_description together)"
             )
+
+        if config.rejection_memory.store not in {"run_directory", "in_memory"}:
+            raise ValueError("rejection_memory.store must be 'run_directory' or 'in_memory'")
+        for name in ("max_rationale_bytes", "max_evidence_bytes"):
+            value = getattr(config.rejection_memory, name)
+            if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 4096:
+                raise ValueError(f"rejection_memory.{name} must be between 1 and 4096 bytes")
+        if config.rejection_memory.feedback_recent_k < 0:
+            raise ValueError("rejection_memory.feedback_recent_k must be non-negative")
+        if config.rejection_memory.repair_max_attempts < 0:
+            raise ValueError("rejection_memory.repair_max_attempts must be non-negative")
 
         return config
 
