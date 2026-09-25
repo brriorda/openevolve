@@ -13,12 +13,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from openevolve.config import Config, load_config
+from openevolve.adjudication import AdjudicationStore
 from openevolve.database import Program, ProgramDatabase
 from openevolve.evaluator import Evaluator
 from openevolve.evolution_trace import EvolutionTracer
 from openevolve.llm.ensemble import LLMEnsemble
 from openevolve.process_parallel import ProcessParallelController
 from openevolve.prompt.sampler import PromptSampler
+from openevolve.rejection_policy import validate_rejection_memory_config
 from openevolve.utils.code_utils import extract_code_language
 from openevolve.utils.format_utils import format_improvement_safe, format_metrics_safe
 
@@ -48,6 +50,8 @@ class OpenEvolve:
     ):
         # Load configuration (loaded in main_async)
         self.config = config
+        # Refuse unsupported policy arms before creating output files or starting providers.
+        self.rejection_policy = validate_rejection_memory_config(self.config.rejection_memory)
 
         # Set up output directory
         self.output_dir = output_dir or os.path.join(
@@ -240,6 +244,18 @@ class OpenEvolve:
             Best program found
         """
         max_iterations = iterations or self.config.max_iterations
+        pending_adjudication = AdjudicationStore(self.output_dir).load()
+        if pending_adjudication is not None:
+            pending_checkpoint = pending_adjudication["checkpoint_path"]
+            checkpoint_root = (Path(self.output_dir) / "checkpoints").resolve()
+            resolved_checkpoint = Path(pending_checkpoint).resolve()
+            if not resolved_checkpoint.is_relative_to(checkpoint_root):
+                raise ValueError("pending adjudication checkpoint is outside the run directory")
+            if not resolved_checkpoint.is_dir():
+                raise FileNotFoundError(f"pending adjudication checkpoint is missing: {resolved_checkpoint}")
+            if checkpoint_path is not None and Path(checkpoint_path).resolve() != Path(pending_checkpoint).resolve():
+                raise ValueError("resume checkpoint does not match pending adjudication")
+            checkpoint_path = pending_checkpoint
         # Determine starting iteration
         start_iteration = 0
         if checkpoint_path and os.path.exists(checkpoint_path):
@@ -266,6 +282,11 @@ class OpenEvolve:
             initial_metrics = await self.evaluator.evaluate_program(
                 self.initial_program_code, initial_program_id
             )
+            if not isinstance(initial_metrics, dict):
+                raise ValueError(
+                    "Initial program evaluation must return a metrics dictionary; "
+                    f"received {type(initial_metrics).__name__}"
+                )
 
             initial_program = Program(
                 id=initial_program_id,
@@ -314,6 +335,8 @@ class OpenEvolve:
                 self.database,
                 self.evolution_tracer,
                 file_suffix=self.config.file_suffix,
+                output_dir=self.output_dir,
+                evaluator=self.evaluator,
             )
 
             # Set up signal handlers for graceful shutdown

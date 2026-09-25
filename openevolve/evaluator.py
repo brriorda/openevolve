@@ -20,6 +20,11 @@ import traceback
 from openevolve.config import EvaluatorConfig
 from openevolve.database import ProgramDatabase
 from openevolve.evaluation_result import EvaluationResult
+from openevolve.rejection import (
+    CandidateAccepted, CandidateRejected, EvaluationNeedsAdjudication,
+    EvaluationRetryableFailure, RunFatalFailure,
+    sanitize_rejection_content,
+)
 from openevolve.database import ProgramDatabase
 from openevolve.llm.ensemble import LLMEnsemble
 from openevolve.utils.async_utils import TaskPool, run_in_executor
@@ -133,7 +138,7 @@ class Evaluator:
         self,
         program_code: str,
         program_id: str = "",
-    ) -> Dict[str, float]:
+    ) -> Union[Dict[str, float], CandidateRejected, EvaluationRetryableFailure, EvaluationNeedsAdjudication, RunFatalFailure]:
         """
         Evaluate a program and return scores
 
@@ -169,6 +174,15 @@ class Evaluator:
 
                 # Process the result based on type
                 eval_result = self._process_evaluation_result(result)
+                if isinstance(eval_result, CandidateRejected):
+                    return eval_result
+                if isinstance(eval_result, EvaluationRetryableFailure):
+                    if eval_result.auto_retry and attempt < self.config.max_retries:
+                        await asyncio.sleep(max(0.0, eval_result.retry_after_seconds or 0.0))
+                        continue
+                    return eval_result
+                if isinstance(eval_result, (EvaluationNeedsAdjudication, RunFatalFailure)):
+                    return eval_result
 
                 # Check if this was a timeout and capture artifacts if enabled
                 if artifacts_enabled and program_id and eval_result.metrics.get("timeout") is True:
@@ -189,6 +203,8 @@ class Evaluator:
                 if self.config.use_llm_feedback and self.llm_ensemble:
                     llm_result = await self._llm_evaluate(program_code, program_id=program_id)
                     llm_eval_result = self._process_evaluation_result(llm_result)
+                    if isinstance(llm_eval_result, (CandidateRejected, EvaluationRetryableFailure, EvaluationNeedsAdjudication, RunFatalFailure)):
+                        return llm_eval_result
 
                     # Combine metrics
                     llm_scores = []
@@ -262,7 +278,11 @@ class Evaluator:
                         "error_type": "timeout",
                     }
 
-                return {"error": 0.0, "timeout": True}
+                return EvaluationRetryableFailure(
+                    code="evaluation_timeout",
+                    message=f"Evaluation timed out after {self.config.timeout}s",
+                    auto_retry=False,
+                )
 
             except Exception as e:
                 last_exception = e
@@ -293,9 +313,14 @@ class Evaluator:
         logger.error(
             f"All evaluation attempts failed for program{program_id_str}. Last error: {str(last_exception)}"
         )
-        return {"error": 0.0}
+        safe_message, _ = sanitize_rejection_content(str(last_exception), None)
+        return EvaluationRetryableFailure(
+            code="evaluation_exception", message=safe_message,
+        )
 
-    def _process_evaluation_result(self, result: Any) -> EvaluationResult:
+    def _process_evaluation_result(
+        self, result: Any
+    ) -> Union[EvaluationResult, CandidateRejected, EvaluationRetryableFailure, EvaluationNeedsAdjudication, RunFatalFailure]:
         """
         Process evaluation result to handle both dict and EvaluationResult returns
 
@@ -311,10 +336,14 @@ class Evaluator:
         elif isinstance(result, EvaluationResult):
             # New format - use directly
             return result
+        elif isinstance(result, CandidateAccepted):
+            return EvaluationResult(metrics=dict(result.metrics), artifacts=dict(result.artifacts))
+        elif isinstance(result, CandidateRejected):
+            return result
+        elif isinstance(result, (EvaluationRetryableFailure, EvaluationNeedsAdjudication, RunFatalFailure)):
+            return result
         else:
-            # Error case - return error metrics
-            logger.warning(f"Unexpected evaluation result type: {type(result)}")
-            return EvaluationResult(metrics={"error": 0.0})
+            raise TypeError(f"Unexpected evaluation result type: {type(result)}")
 
     def get_pending_artifacts(self, program_id: str) -> Optional[Dict[str, Union[str, bytes]]]:
         """
@@ -397,27 +426,14 @@ class Evaluator:
 
                 stage1_result = await asyncio.wait_for(run_stage1(), timeout=self.config.timeout)
                 stage1_eval_result = self._process_evaluation_result(stage1_result)
+                if isinstance(stage1_eval_result, (CandidateRejected, EvaluationRetryableFailure, EvaluationNeedsAdjudication, RunFatalFailure)):
+                    return stage1_eval_result
             except asyncio.TimeoutError:
-                logger.warning(f"Stage 1 evaluation timed out after {self.config.timeout}s")
-                return EvaluationResult(
-                    metrics={"stage1_passed": 0.0, "error": 0.0, "timeout": True},
-                    artifacts={
-                        "failure_stage": "stage1",
-                        "timeout": True,
-                    },
-                )
+                return EvaluationRetryableFailure("stage1_timeout", "Stage 1 evaluation timed out", auto_retry=False)
             except Exception as e:
                 logger.error(f"Error in stage 1 evaluation: {str(e)}")
-                # Capture stage 1 failure with enhanced context
-                error_context = self._create_cascade_error_context("stage1", e)
-                return EvaluationResult(
-                    metrics={"stage1_passed": 0.0, "error": 0.0},
-                    artifacts={
-                        "stderr": str(e),
-                        "traceback": traceback.format_exc(),
-                        **error_context,
-                    },
-                )
+                message, _ = sanitize_rejection_content(str(e), None)
+                return EvaluationRetryableFailure("stage1_exception", message, auto_retry=False)
 
             # Check threshold
             if not self._passes_threshold(
@@ -438,30 +454,14 @@ class Evaluator:
 
                 stage2_result = await asyncio.wait_for(run_stage2(), timeout=self.config.timeout)
                 stage2_eval_result = self._process_evaluation_result(stage2_result)
+                if isinstance(stage2_eval_result, (CandidateRejected, EvaluationRetryableFailure, EvaluationNeedsAdjudication, RunFatalFailure)):
+                    return stage2_eval_result
             except asyncio.TimeoutError:
-                logger.warning(f"Stage 2 evaluation timed out after {self.config.timeout}s")
-                # Capture stage 2 failure, but keep stage 1 results
-                stage1_eval_result.artifacts.update(
-                    {
-                        "stage2_timeout": True,
-                        "failure_stage": "stage2",
-                    }
-                )
-                stage1_eval_result.metrics["stage2_passed"] = 0.0
-                stage1_eval_result.metrics["timeout"] = True
-                return stage1_eval_result
+                return EvaluationRetryableFailure("stage2_timeout", "Stage 2 evaluation timed out", auto_retry=False)
             except Exception as e:
                 logger.error(f"Error in stage 2 evaluation: {str(e)}")
-                # Capture stage 2 failure, but keep stage 1 results
-                stage1_eval_result.artifacts.update(
-                    {
-                        "stage2_stderr": str(e),
-                        "stage2_traceback": traceback.format_exc(),
-                        "failure_stage": "stage2",
-                    }
-                )
-                stage1_eval_result.metrics["stage2_passed"] = 0.0
-                return stage1_eval_result
+                message, _ = sanitize_rejection_content(str(e), None)
+                return EvaluationRetryableFailure("stage2_exception", message, auto_retry=False)
 
             # Merge results from stage 1 and 2
             merged_metrics = {}
@@ -500,30 +500,14 @@ class Evaluator:
 
                 stage3_result = await asyncio.wait_for(run_stage3(), timeout=self.config.timeout)
                 stage3_eval_result = self._process_evaluation_result(stage3_result)
+                if isinstance(stage3_eval_result, (CandidateRejected, EvaluationRetryableFailure, EvaluationNeedsAdjudication, RunFatalFailure)):
+                    return stage3_eval_result
             except asyncio.TimeoutError:
-                logger.warning(f"Stage 3 evaluation timed out after {self.config.timeout}s")
-                # Capture stage 3 failure, but keep previous results
-                merged_result.artifacts.update(
-                    {
-                        "stage3_timeout": True,
-                        "failure_stage": "stage3",
-                    }
-                )
-                merged_result.metrics["stage3_passed"] = 0.0
-                merged_result.metrics["timeout"] = True
-                return merged_result
+                return EvaluationRetryableFailure("stage3_timeout", "Stage 3 evaluation timed out", auto_retry=False)
             except Exception as e:
                 logger.error(f"Error in stage 3 evaluation: {str(e)}")
-                # Capture stage 3 failure, but keep previous results
-                merged_result.artifacts.update(
-                    {
-                        "stage3_stderr": str(e),
-                        "stage3_traceback": traceback.format_exc(),
-                        "failure_stage": "stage3",
-                    }
-                )
-                merged_result.metrics["stage3_passed"] = 0.0
-                return merged_result
+                message, _ = sanitize_rejection_content(str(e), None)
+                return EvaluationRetryableFailure("stage3_exception", message, auto_retry=False)
 
             # Merge stage 3 results
             for name, value in stage3_eval_result.metrics.items():
@@ -536,16 +520,8 @@ class Evaluator:
 
         except Exception as e:
             logger.error(f"Error in cascade evaluation: {str(e)}")
-            # Return proper cascade failure result with enhanced context
-            error_context = self._create_cascade_error_context("cascade_setup", e)
-            return EvaluationResult(
-                metrics={"stage1_passed": 0.0, "error": 0.0},
-                artifacts={
-                    "stderr": str(e),
-                    "traceback": traceback.format_exc(),
-                    **error_context,
-                },
-            )
+            message, _ = sanitize_rejection_content(str(e), None)
+            return EvaluationRetryableFailure("cascade_setup_exception", message, auto_retry=False)
 
     async def _llm_evaluate(self, program_code: str, program_id: str = "") -> Dict[str, float]:
         """

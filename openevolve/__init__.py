@@ -12,6 +12,17 @@ from openevolve.api import (
     evolve_code,
     EvolutionResult,
 )
+from openevolve.rejection import (
+    CandidateAccepted,
+    CandidateRejected,
+    EvaluationNeedsAdjudication,
+    EvaluationRetryableFailure,
+    RejectionCategory,
+    RejectionDisposition,
+    RunFatalFailure,
+    reject_candidate,
+)
+from openevolve.adjudication import AdjudicationRequired, MeasurementRetryRequired, resolve_adjudication
 
 __all__ = [
     "Config",
@@ -22,4 +33,15 @@ __all__ = [
     "evolve_algorithm",
     "evolve_code",
     "EvolutionResult",
+    "CandidateAccepted",
+    "CandidateRejected",
+    "EvaluationNeedsAdjudication",
+    "EvaluationRetryableFailure",
+    "RejectionCategory",
+    "RejectionDisposition",
+    "RunFatalFailure",
+    "reject_candidate",
+    "AdjudicationRequired",
+    "MeasurementRetryRequired",
+    "resolve_adjudication",
 ]

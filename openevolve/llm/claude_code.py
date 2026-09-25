@@ -60,6 +60,8 @@ class ClaudeCodeLLM(LLMInterface):
     async def generate_with_context(
         self, system_message: str, messages: List[Dict[str, str]], **kwargs
     ) -> str:
+        self.last_usage = {}
+        self.last_call_attempts = 0
         user_content = "\n\n".join(
             m.get("content", "") for m in messages if m.get("role") == "user"
         )
@@ -88,6 +90,7 @@ class ClaudeCodeLLM(LLMInterface):
         loop = asyncio.get_event_loop()
         for attempt in range(retries + 1):
             try:
+                self.last_call_attempts += 1
                 result = await asyncio.wait_for(
                     loop.run_in_executor(None, lambda: self._run_cli(cmd, timeout)),
                     timeout=timeout + 30,

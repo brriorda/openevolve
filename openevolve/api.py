@@ -14,6 +14,8 @@ from pathlib import Path
 from openevolve.controller import OpenEvolve
 from openevolve.config import Config, load_config, LLMModelConfig
 from openevolve.database import Program
+from openevolve.rejection_policy import validate_rejection_memory_config
+from openevolve.adjudication import AdjudicationRequired, resolve_adjudication
 
 
 @dataclass
@@ -109,6 +111,7 @@ async def _run_evolution_async(
     """Async implementation of run_evolution"""
 
     temp_dir = None
+    durable_run = False
     temp_files = []
 
     try:
@@ -119,6 +122,9 @@ async def _run_evolution_async(
             config_obj = config
         else:
             config_obj = load_config(str(config))
+
+        # Fail unsupported experiment arms before provider validation or output-directory creation.
+        validate_rejection_memory_config(config_obj.rejection_memory)
 
         # Validate that LLM models are configured
         if not config_obj.llm.models:
@@ -132,6 +138,7 @@ async def _run_evolution_async(
             )
 
         # Set up output directory
+        durable_run = config_obj.rejection_memory.store == "run_directory"
         if output_dir is None and cleanup:
             temp_dir = tempfile.mkdtemp(prefix="openevolve_")
             actual_output_dir = temp_dir
@@ -178,12 +185,16 @@ async def _run_evolution_async(
                 if numeric_metrics:
                     best_score = sum(numeric_metrics) / len(numeric_metrics)
 
+        has_persistent_state = durable_run and (
+            Path(actual_output_dir, "attempts", "rejected_attempts.jsonl").exists()
+            or Path(actual_output_dir, "adjudication", "pending.json").exists()
+        )
         return EvolutionResult(
             best_program=best_program,
             best_score=best_score,
             best_code=best_code,
             metrics=metrics,
-            output_dir=actual_output_dir if not cleanup else None,
+            output_dir=actual_output_dir if has_persistent_state or not cleanup else None,
         )
 
     finally:
@@ -194,7 +205,11 @@ async def _run_evolution_async(
                     os.unlink(temp_file)
                 except:
                     pass
-            if temp_dir and os.path.exists(temp_dir):
+            has_persistent_state = durable_run and (
+                Path(temp_dir, "attempts", "rejected_attempts.jsonl").exists()
+                or Path(temp_dir, "adjudication", "pending.json").exists()
+            ) if temp_dir else False
+            if temp_dir and os.path.exists(temp_dir) and not has_persistent_state:
                 import shutil
 
                 try:

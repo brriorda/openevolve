@@ -109,6 +109,8 @@ class OpenAILLM(LLMInterface):
         self, system_message: str, messages: List[Dict[str, str]], **kwargs
     ) -> str:
         """Generate text using a system message and conversational context"""
+        self.last_usage = {}
+        self.last_call_attempts = 0
         # Prepare messages with system message
         formatted_messages = [{"role": "system", "content": system_message}]
         formatted_messages.extend(messages)
@@ -186,12 +188,14 @@ class OpenAILLM(LLMInterface):
         # Manual mode: no timeout unless explicitly passed by the caller
         if self.manual_mode:
             timeout = kwargs.get("timeout", None)
+            self.last_call_attempts = 1
             return await self._manual_wait_for_answer(params, timeout=timeout)
 
         timeout = kwargs.get("timeout", self.timeout)
 
         for attempt in range(retries + 1):
             try:
+                self.last_call_attempts += 1
                 response = await asyncio.wait_for(self._call_api(params), timeout=timeout)
                 return response
             except asyncio.TimeoutError:
@@ -221,6 +225,13 @@ class OpenAILLM(LLMInterface):
         response = await loop.run_in_executor(
             None, lambda: self.client.chat.completions.create(**params)
         )
+        receipt = getattr(response, "usage", None)
+        if receipt is not None:
+            self.last_usage = {
+                name: value
+                for name in ("prompt_tokens", "completion_tokens", "total_tokens")
+                if isinstance((value := getattr(receipt, name, None)), int) and value >= 0
+            }
         # Logging of system prompt, user message and response content
         logger = logging.getLogger(__name__)
         logger.debug(f"API parameters: {params}")

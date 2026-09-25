@@ -746,6 +746,47 @@ return EvaluationResult(
 
 **Next generation prompt automatically includes:**
 
+### Explicit candidate rejection
+
+An evaluator may return a typed candidate rejection when it has evidence that a proposal violates a
+candidate-level requirement. This creates a separate bounded attempt record; in this initial release,
+the default `artifact_low_score` policy still keeps the candidate in the population with the configured
+`rejection_memory.penalty_score` (default `0.0`) and a rejection artifact for compatibility.
+Provider outages, timeouts, and unresolved measurements are operational failures,
+not candidate rejection reasons.
+
+```python
+from openevolve import reject_candidate
+
+def evaluate(program_path):
+    if not defines_required_entrypoint(program_path):
+        return reject_candidate(
+            category="static_invalid",
+            code="required_entrypoint_missing",
+            rationale="The candidate does not define the required entry point.",
+            evidence={"validator_code": "ENTRYPOINT_MISSING"},
+        )
+    return {"combined_score": run_benchmark(program_path)}
+```
+
+The current supported policy is `artifact_low_score`. Other declared experiment policies fail during
+preflight until their implementation is installed. The attempt ledger is written to
+`<output_dir>/attempts/rejected_attempts.jsonl` with bounded, allow-listed fields. The ledger records
+the selected proposal model and provider-reported token usage when available. An initial seed must
+return metrics; only proposals with an admitted parent can produce rejection attempts.
+
+An evaluator can return `EvaluationNeedsAdjudication(request_id="judge-42")` to pause the run. The
+pending candidate and its checkpoint are saved under the run output directory. Resolve it with
+`resolve_adjudication(output_dir, "judge-42", "assign", outcome={"combined_score": 0.8})`,
+`resolve_adjudication(output_dir, "judge-42", "retry")`, or
+`resolve_adjudication(output_dir, "judge-42", "terminate")`. Then call `run_evolution` again with the
+same output directory and inputs. Retry evaluates the saved candidate code before any new mutation.
+`AdjudicationRequired` exposes `request_id` and `output_dir` to the caller. When no output directory was
+specified, a run with attempts or pending adjudication retains its temporary directory and returns its
+path (or exposes it on the exception) so the record remains available. Exhausted retryable measurement
+failures raise `MeasurementRetryRequired` and save the same candidate. Resolve that request with
+`retry` or `terminate` before resuming; retry never samples a new mutation first.
+
 ```markdown
 ## Previous Execution Feedback
 ⚠️ Warning: suboptimal memory access pattern
