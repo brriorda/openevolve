@@ -3,12 +3,13 @@ Tests for worker-to-island pinning to ensure true island isolation
 """
 
 import unittest
-from unittest.mock import Mock, patch, MagicMock
+from concurrent.futures import Future
+from unittest.mock import patch, MagicMock
 import asyncio
 
-from openevolve.config import Config, DatabaseConfig, EvaluatorConfig
+from openevolve.config import Config
 from openevolve.database import ProgramDatabase, Program
-from openevolve.process_parallel import ProcessParallelController
+from openevolve.process_parallel import ProcessParallelController, SerializableResult
 
 
 class TestIslandIsolation(unittest.TestCase):
@@ -133,7 +134,9 @@ class TestIslandIsolation(unittest.TestCase):
         def mock_submit_iteration(iteration, island_id=None):
             if island_id is not None:
                 submitted_islands.append(island_id)
-            return MagicMock()
+            future = Future()
+            future.set_result(SerializableResult(iteration=iteration, outcome_type="empty"))
+            return future
 
         # Start the process pool
         controller.start()

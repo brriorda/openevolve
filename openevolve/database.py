@@ -11,6 +11,7 @@ import shutil
 import time
 import uuid
 from dataclasses import asdict, dataclass, field, fields
+from enum import Enum
 
 # FileLock removed - no longer needed with threaded parallel processing
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -18,10 +19,21 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import numpy as np
 
 from openevolve.config import DatabaseConfig
-from openevolve.utils.code_utils import calculate_edit_distance
 from openevolve.utils.metrics_utils import safe_numeric_average, get_fitness_score
 
 logger = logging.getLogger(__name__)
+
+
+class ProgramAdmission(str, Enum):
+    """Decision supplied to the final program-storage boundary.
+
+    Use ``ProgramAdmission.DISCARDED`` for an explicitly rejected candidate;
+    ``ProgramDatabase.add`` will refuse it before changing population state.
+    """
+
+    ACCEPTED = "accepted"
+    BASELINE_REJECTED = "baseline_rejected"
+    DISCARDED = "discarded"
 
 
 def _safe_sum_metrics(metrics: Dict[str, Any]) -> float:
@@ -177,13 +189,13 @@ class ProgramDatabase:
             logger.debug(f"Database: Set random seed to {config.random_seed}")
 
         # Diversity caching infrastructure
-        self.diversity_cache: Dict[int, Dict[str, Union[float, float]]] = (
-            {}
-        )  # hash -> {"value": float, "timestamp": float}
+        self.diversity_cache: Dict[
+            int, Dict[str, Union[float, float]]
+        ] = {}  # hash -> {"value": float, "timestamp": float}
         self.diversity_cache_size: int = 1000  # LRU cache size
-        self.diversity_reference_set: List[str] = (
-            []
-        )  # Reference program codes for consistent diversity
+        self.diversity_reference_set: List[
+            str
+        ] = []  # Reference program codes for consistent diversity
         self.diversity_reference_size: int = getattr(config, "diversity_reference_size", 20)
 
         # Feature scaling infrastructure
@@ -211,8 +223,13 @@ class ProgramDatabase:
         self.similarity_threshold = config.similarity_threshold
 
     def add(
-        self, program: Program, iteration: int = None, target_island: Optional[int] = None
-    ) -> str:
+        self,
+        program: Program,
+        iteration: Optional[int] = None,
+        target_island: Optional[int] = None,
+        *,
+        admission: ProgramAdmission = ProgramAdmission.ACCEPTED,
+    ) -> Optional[str]:
         """
         Add a program to the database
 
@@ -220,21 +237,25 @@ class ProgramDatabase:
             program: Program to add
             iteration: Current iteration (defaults to last_iteration)
             target_island: Specific island to add to (auto-detects parent's island if None)
+            admission: Typed admission decision; discarded candidates are refused.
 
         Returns:
-            Program ID
+            Program ID when admitted, or ``None`` when the novelty check rejects it.
         """
-        # Store the program
+        if not isinstance(program, Program):
+            raise TypeError("only Program instances can enter ProgramDatabase")
+        if not isinstance(admission, ProgramAdmission):
+            raise TypeError("admission must be a ProgramAdmission value")
+        if admission is ProgramAdmission.DISCARDED:
+            raise ValueError("discarded candidate cannot enter ProgramDatabase")
+        if program.id in self.programs:
+            raise ValueError(f"program ID already exists: {program.id}")
+
         # If iteration is provided, update the program's iteration_found
         if iteration is not None:
             program.iteration_found = iteration
             # Update last_iteration if needed
             self.last_iteration = max(self.last_iteration, iteration)
-
-        self.programs[program.id] = program
-
-        # Calculate feature coordinates for MAP-Elites
-        feature_coords = self._calculate_feature_coords(program)
 
         # Determine target island
         # If target_island is not specified and program has a parent, inherit parent's island
@@ -267,11 +288,15 @@ class ProgramDatabase:
         island_idx = island_idx % len(self.islands)  # Ensure valid island
 
         # Novelty check before adding
-        if not self._is_novel(program.id, island_idx):
+        if not self._is_novel(program, island_idx):
             logger.debug(
                 f"Program {program.id} failed in novelty check and won't be added in the island {island_idx}"
             )
-            return program.id  # Do not add non-novel program
+            return None
+
+        # Only admitted programs can change population and feature statistics.
+        self.programs[program.id] = program
+        feature_coords = self._calculate_feature_coords(program)
 
         # Add to island-specific feature map (replacing existing if better)
         feature_key = self._feature_coords_to_key(feature_coords)
@@ -542,7 +567,7 @@ class ProgramDatabase:
                 old_score = self.programs[old_id].metrics["combined_score"]
                 new_score = self.programs[self.best_program_id].metrics["combined_score"]
                 logger.info(
-                    f"Score change: {old_score:.4f} → {new_score:.4f} ({new_score-old_score:+.4f})"
+                    f"Score change: {old_score:.4f} → {new_score:.4f} ({new_score - old_score:+.4f})"
                 )
 
         return sorted_programs[0] if sorted_programs else None
@@ -563,7 +588,9 @@ class ProgramDatabase:
         """
         # Validate island_idx parameter
         if island_idx is not None and (island_idx < 0 or island_idx >= len(self.islands)):
-            raise IndexError(f"Island index {island_idx} is out of range (0-{len(self.islands)-1})")
+            raise IndexError(
+                f"Island index {island_idx} is out of range (0-{len(self.islands) - 1})"
+            )
 
         if not self.programs:
             return []
@@ -1016,7 +1043,7 @@ class ProgramDatabase:
         try:
             # Check if we're already in an event loop
             try:
-                loop = asyncio.get_running_loop()
+                asyncio.get_running_loop()
                 # We're in an async context, need to run in a new thread
                 import concurrent.futures
 
@@ -1067,7 +1094,7 @@ class ProgramDatabase:
 
         return True
 
-    def _is_novel(self, program_id: int, island_idx: int) -> bool:
+    def _is_novel(self, program: Program, island_idx: int) -> bool:
         """
         Determine if a program is novel based on diversity to existing programs
 
@@ -1082,9 +1109,8 @@ class ProgramDatabase:
             # Novelty checking disabled
             return True
 
-        program = self.programs[program_id]
         embd = self.embedding_client.get_embedding(program.code)
-        self.programs[program_id].embedding = embd
+        program.embedding = embd
 
         max_smlty = float("-inf")
         max_smlty_pid = None
@@ -1534,7 +1560,7 @@ class ProgramDatabase:
         """
         if not self.archive:
             # Fallback to weighted sampling from island
-            logger.debug(f"Archive is empty, falling back to weighted island sampling")
+            logger.debug("Archive is empty, falling back to weighted island sampling")
             return self._sample_from_island_weighted(island_id)
 
         # Clean up stale references in archive
@@ -1668,10 +1694,8 @@ class ProgramDatabase:
                 remaining = n - len(inspirations) - len(nearby_programs)
 
                 # Get available programs from the island
-                excluded_ids = (
-                    {parent.id}
-                    .union(p.id for p in inspirations)
-                    .union(p.id for p in nearby_programs)
+                excluded_ids = {parent.id}.union(p.id for p in inspirations).union(
+                    p.id for p in nearby_programs
                 )
                 available_island_ids = [
                     pid
@@ -1916,14 +1940,15 @@ class ProgramDatabase:
 
                     # Use add() method to properly handle MAP-Elites deduplication,
                     # feature map updates, and island tracking
-                    self.add(migrant_copy, target_island=target_island)
+                    admitted_id = self.add(migrant_copy, target_island=target_island)
 
-                    # Log migration
-                    logger.info(
-                        "Program %s migrated to island %d",
-                        migrant_copy.id[:8],
-                        target_island,
-                    )
+                    # Only an admitted migrant has changed the target island.
+                    if admitted_id is not None:
+                        logger.info(
+                            "Program %s migrated to island %d",
+                            migrant_copy.id[:8],
+                            target_island,
+                        )
 
         # Update last migration generation
         self.last_migration_generation = max(self.island_generations)

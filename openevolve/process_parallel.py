@@ -5,20 +5,22 @@ Process-based parallel controller for true parallelism
 import asyncio
 import logging
 import multiprocessing as mp
-import pickle
-import signal
 import time
 import uuid
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from openevolve.config import Config
-from openevolve.adjudication import AdjudicationRequired, AdjudicationStore, MeasurementRetryRequired
+from openevolve.adjudication import (
+    AdjudicationRequired,
+    AdjudicationStore,
+    MeasurementRetryRequired,
+)
 from openevolve.attempt_store import AttemptStore, InMemoryAttemptStore, RunDirectoryAttemptStore
-from openevolve.database import Program, ProgramDatabase
+from openevolve.database import Program, ProgramAdmission, ProgramDatabase
 from openevolve.rejection import (
     CandidateAccepted,
     CandidateRejected,
@@ -32,6 +34,7 @@ from openevolve.rejection import (
     digest_text,
     sanitize_rejection_content,
 )
+from openevolve.rejection_policy import resolve_rejection_policy, validate_rejection_memory_config
 from openevolve.utils.metrics_utils import safe_numeric_average
 
 logger = logging.getLogger(__name__)
@@ -54,13 +57,24 @@ class SerializableResult:
     outcome_type: str = "legacy"
     pending_candidate_dict: Optional[Dict[str, Any]] = None
     operational_outcome_dict: Optional[Dict[str, Any]] = None
+    inspiration_ids: tuple[str, ...] = ()
+    provider_usage: Optional[Dict[str, int | float]] = None
+    proposal_model: Optional[str] = None
 
 
 def _generation_rejection(
-    *, iteration: int, parent_id: str, inspiration_ids: List[str],
-    target_island: Optional[int], code: str, rationale: str,
-    candidate_code: Optional[str], prompt: Dict[str, str], response: str,
-    provider_usage: Dict[str, int | float], proposal_model: str,
+    *,
+    iteration: int,
+    parent_id: str,
+    inspiration_ids: List[str],
+    target_island: Optional[int],
+    code: str,
+    rationale: str,
+    candidate_code: Optional[str],
+    prompt: Dict[str, str],
+    response: str,
+    provider_usage: Dict[str, int | float],
+    proposal_model: str,
     category: RejectionCategory = RejectionCategory.GENERATION_FORMAT_INVALID,
 ) -> SerializableResult:
     """Build a rejected attempt for a proposal that cannot become a child program.
@@ -83,28 +97,42 @@ def _generation_rejection(
         Worker result containing a bounded attempt record and no insertable child.
     """
     safe_rationale, evidence = sanitize_rejection_content(
-        rationale, {"stage": "generation"},
+        rationale,
+        {"stage": "generation"},
         max_rationale_bytes=_worker_config.rejection_memory.max_rationale_bytes,
         max_evidence_bytes=_worker_config.rejection_memory.max_evidence_bytes,
     )
     attempt = RejectedAttempt(
-        attempt_id=str(uuid.uuid5(
-            uuid.NAMESPACE_URL,
-            f"{parent_id}:{iteration}:{digest_text(response)}:{digest_text(candidate_code)}:{code}",
-        )),
-        iteration=iteration, parent_id=parent_id, inspiration_ids=tuple(inspiration_ids),
-        target_island=target_island, candidate_hash=digest_text(candidate_code),
-        category=category, code=code,
-        stage="generation", rationale=safe_rationale, evidence=evidence,
-        repairable=True, disposition=RejectionDisposition.DISCARDED,
+        attempt_id=str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"{parent_id}:{iteration}:{digest_text(response)}:{digest_text(candidate_code)}:{code}",
+            )
+        ),
+        iteration=iteration,
+        parent_id=parent_id,
+        inspiration_ids=tuple(inspiration_ids),
+        target_island=target_island,
+        candidate_hash=digest_text(candidate_code),
+        category=category,
+        code=code,
+        stage="generation",
+        rationale=safe_rationale,
+        evidence=evidence,
+        repairable=True,
+        disposition=RejectionDisposition.DISCARDED,
         config_fingerprint=digest_mapping(asdict(_worker_config.rejection_memory)),
         prompt_digest=digest_text(prompt["system"] + "\n" + prompt["user"]),
-        response_digest=digest_text(response), provider_usage=provider_usage,
+        response_digest=digest_text(response),
+        provider_usage=provider_usage,
         proposal_model=proposal_model,
     )
     return SerializableResult(
-        iteration=iteration, parent_id=parent_id, target_island=target_island,
-        rejected_attempt_dict=attempt.to_dict(), outcome_type="rejected",
+        iteration=iteration,
+        parent_id=parent_id,
+        target_island=target_island,
+        rejected_attempt_dict=attempt.to_dict(),
+        outcome_type="rejected",
     )
 
 
@@ -281,10 +309,14 @@ def _run_iteration_worker(
         except Exception as e:
             logger.error(f"LLM generation failed: {e}")
             return SerializableResult(
-                outcome_type="fatal_failure", iteration=iteration,
-                operational_outcome_dict=asdict(RunFatalFailure(
-                    code="proposal_generation_failed", message="Proposal model generation failed"
-                )),
+                outcome_type="fatal_failure",
+                iteration=iteration,
+                operational_outcome_dict=asdict(
+                    RunFatalFailure(
+                        code="proposal_generation_failed",
+                        message="Proposal model generation failed",
+                    )
+                ),
             )
 
         # Check for None response
@@ -292,16 +324,25 @@ def _run_iteration_worker(
             raise RuntimeError("LLM returned None response")
 
         def reject_generation(
-            code: str, rationale: str, candidate_code: Optional[str] = None,
+            code: str,
+            rationale: str,
+            candidate_code: Optional[str] = None,
             category: RejectionCategory = RejectionCategory.GENERATION_FORMAT_INVALID,
         ) -> SerializableResult:
             """Bind proposal identity and accounting to a format rejection."""
             return _generation_rejection(
-                iteration=iteration, parent_id=parent.id, inspiration_ids=inspiration_ids,
-                target_island=db_snapshot.get("sampling_island"), code=code,
-                rationale=rationale, candidate_code=candidate_code, prompt=prompt,
-                response=llm_response, provider_usage=provider_usage,
-                proposal_model=proposal_model, category=category,
+                iteration=iteration,
+                parent_id=parent.id,
+                inspiration_ids=inspiration_ids,
+                target_island=db_snapshot.get("sampling_island"),
+                code=code,
+                rationale=rationale,
+                candidate_code=candidate_code,
+                prompt=prompt,
+                response=llm_response,
+                provider_usage=provider_usage,
+                proposal_model=proposal_model,
+                category=category,
             )
 
         # Parse response based on evolution mode
@@ -339,7 +380,11 @@ def _run_iteration_worker(
                     or not child_changes_desc.strip()
                     or child_changes_desc.strip() == parent_changes_desc.strip()
                 ):
-                    return reject_generation("changes_description_invalid", "changes_description was not updated or empty", child_code)
+                    return reject_generation(
+                        "changes_description_invalid",
+                        "changes_description was not updated or empty",
+                        child_code,
+                    )
 
                 changes_summary = format_diff_summary(
                     code_blocks,
@@ -367,14 +412,19 @@ def _run_iteration_worker(
         # Check code length
         if len(child_code) > _worker_config.max_code_length:
             return reject_generation(
-                "code_too_long", "Generated code exceeds maximum length", child_code,
+                "code_too_long",
+                "Generated code exceeds maximum length",
+                child_code,
                 RejectionCategory.STATIC_INVALID,
             )
 
         # Evaluate the child program
         child_id = str(uuid.uuid4())
         child_metrics = asyncio.run(_worker_evaluator.evaluate_program(child_code, child_id))
-        if isinstance(child_metrics, (EvaluationRetryableFailure, EvaluationNeedsAdjudication, RunFatalFailure)):
+        if isinstance(
+            child_metrics,
+            (EvaluationRetryableFailure, EvaluationNeedsAdjudication, RunFatalFailure),
+        ):
             outcome_types = {
                 EvaluationRetryableFailure: "retryable_failure",
                 EvaluationNeedsAdjudication: "needs_adjudication",
@@ -386,21 +436,27 @@ def _run_iteration_worker(
                 operational_detail["candidate_hash"] = digest_text(child_code)
             if isinstance(operational_detail.get("message"), str):
                 operational_detail["message"], _ = sanitize_rejection_content(
-                    operational_detail["message"], None,
+                    operational_detail["message"],
+                    None,
                 )
             return SerializableResult(
-                iteration=iteration, parent_id=parent.id,
+                iteration=iteration,
+                parent_id=parent.id,
                 target_island=db_snapshot.get("sampling_island"),
                 outcome_type=outcome_types[type(child_metrics)],
                 operational_outcome_dict=operational_detail,
                 pending_candidate_dict={
-                    "id": child_id, "code": child_code, "parent_id": parent.id,
+                    "id": child_id,
+                    "code": child_code,
+                    "parent_id": parent.id,
                     "inspiration_ids": list(inspiration_ids),
                     "target_island": db_snapshot.get("sampling_island"),
                     "changes_description": child_changes_desc,
-                    "changes_summary": changes_summary, "parent_island": parent_island,
+                    "changes_summary": changes_summary,
+                    "parent_island": parent_island,
                     "generation": parent.generation + 1,
-                    "proposal_model": proposal_model, "provider_usage": provider_usage,
+                    "proposal_model": proposal_model,
+                    "provider_usage": provider_usage,
                     "prompt_digest": digest_text(prompt["system"] + "\n" + prompt["user"]),
                     "response_digest": digest_text(llm_response),
                 },
@@ -414,10 +470,12 @@ def _run_iteration_worker(
                 max_evidence_bytes=_worker_config.rejection_memory.max_evidence_bytes,
             )
             rejected_attempt = RejectedAttempt(
-                attempt_id=str(uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"{parent.id}:{iteration}:{digest_text(llm_response)}:{digest_text(child_code)}:{child_metrics.code}",
-                )),
+                attempt_id=str(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"{parent.id}:{iteration}:{digest_text(llm_response)}:{digest_text(child_code)}:{child_metrics.code}",
+                    )
+                ),
                 iteration=iteration,
                 parent_id=parent.id,
                 inspiration_ids=tuple(inspiration_ids),
@@ -437,24 +495,43 @@ def _run_iteration_worker(
                 proposal_model=proposal_model,
             )
             rejected_attempt_dict = rejected_attempt.to_dict()
-            # The baseline policy records rejection while retaining low-score admission.
+            if not resolve_rejection_policy(
+                _worker_config.rejection_memory.policy
+            ).admit_rejected_program:
+                # A discarded attempt has no Program or program-owned artifacts.
+                return SerializableResult(
+                    parent_id=parent.id,
+                    iteration_time=time.time() - iteration_start,
+                    prompt=prompt,
+                    llm_response=llm_response,
+                    iteration=iteration,
+                    target_island=db_snapshot.get("sampling_island"),
+                    rejected_attempt_dict=rejected_attempt_dict,
+                    outcome_type="rejected",
+                )
+            # The baseline policy retains low-score admission for comparison.
             child_metrics = {"combined_score": _worker_config.rejection_memory.penalty_score}
         elif isinstance(child_metrics, CandidateAccepted):
             child_metrics = dict(child_metrics.metrics)
 
         # Get artifacts
         artifacts = _worker_evaluator.get_pending_artifacts(child_id)
-        if rejected_attempt_dict is not None and _worker_config.rejection_memory.policy == "artifact_low_score":
+        if (
+            rejected_attempt_dict is not None
+            and _worker_config.rejection_memory.policy == "artifact_low_score"
+        ):
             import json
             import os
 
             if os.environ.get("ENABLE_ARTIFACTS", "true").lower() == "true":
                 artifacts = dict(artifacts or {})
-                artifacts["rejection"] = json.dumps({
-                    "category": rejected_attempt_dict["category"],
-                    "code": rejected_attempt_dict["code"],
-                    "rationale": rejected_attempt_dict["rationale"],
-                })
+                artifacts["rejection"] = json.dumps(
+                    {
+                        "category": rejected_attempt_dict["category"],
+                        "code": rejected_attempt_dict["code"],
+                        "rationale": rejected_attempt_dict["rationale"],
+                    }
+                )
 
         # Create child program
         child_program = Program(
@@ -489,6 +566,9 @@ def _run_iteration_worker(
             target_island=target_island,
             rejected_attempt_dict=rejected_attempt_dict,
             outcome_type="rejected" if rejected_attempt_dict else "accepted",
+            inspiration_ids=tuple(inspiration_ids),
+            provider_usage=provider_usage,
+            proposal_model=proposal_model,
         )
 
     except Exception as e:
@@ -565,6 +645,7 @@ class ProcessParallelController:
         evaluator: Any = None,
     ):
         self.config = config
+        self.rejection_policy = validate_rejection_memory_config(config.rejection_memory)
         self.evaluation_file = evaluation_file
         self.database = database
         self.evolution_tracer = evolution_tracer
@@ -587,6 +668,60 @@ class ProcessParallelController:
         self.num_islands = config.database.num_islands
 
         logger.info(f"Initialized process parallel controller with {self.num_workers} workers")
+
+    def _record_novelty_rejection(
+        self,
+        child: Program,
+        iteration: int,
+        target_island: Optional[int],
+        inspiration_ids: tuple[str, ...] = (),
+        prompt_digest: Optional[str] = None,
+        response_digest: Optional[str] = None,
+        provider_usage: Optional[Dict[str, int | float]] = None,
+        proposal_model: Optional[str] = None,
+    ) -> None:
+        """Record a novelty refusal as an attempt without admitting its program.
+
+        Args:
+            child: Evaluated candidate refused by the database novelty check.
+            iteration: Proposal iteration, retained for resume accounting.
+            target_island: Island where novelty was evaluated.
+            inspiration_ids: Admitted programs used as additional examples.
+            prompt_digest: Hash of the proposal prompt, when available.
+            response_digest: Hash of the proposal response, when available.
+            provider_usage: Proposal-model usage counters.
+            proposal_model: Proposal model name.
+        """
+        if self.database.get(child.id) is not None:
+            raise RuntimeError("novelty-rejected candidate is already in ProgramDatabase")
+        if child.parent_id is None:
+            raise RuntimeError("novelty-rejected candidate has no admitted parent")
+        attempt = RejectedAttempt(
+            attempt_id=str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"{child.parent_id}:{iteration}:{digest_text(child.code)}:novelty_check_failed",
+                )
+            ),
+            iteration=iteration,
+            parent_id=child.parent_id,
+            inspiration_ids=inspiration_ids,
+            target_island=target_island,
+            candidate_hash=digest_text(child.code),
+            category=RejectionCategory.NOVELTY_REJECTED,
+            code="novelty_check_failed",
+            stage="admission",
+            rationale="Candidate did not pass the configured novelty check.",
+            evidence={"stage": "admission"},
+            repairable=False,
+            disposition=RejectionDisposition.DISCARDED,
+            config_fingerprint=digest_mapping(asdict(self.config.rejection_memory)),
+            prompt_digest=prompt_digest,
+            response_digest=response_digest,
+            provider_usage=provider_usage or {},
+            proposal_model=proposal_model,
+        )
+        self.attempt_store.append(attempt)
 
     async def _resume_pending(self, checkpoint_callback: Any) -> Optional[int]:
         """Resolve or remeasure the saved candidate before submitting a new proposal.
@@ -617,7 +752,9 @@ class ProcessParallelController:
         if disposition == "retry":
             if self.resume_evaluator is None:
                 raise RuntimeError("resuming adjudication requires an evaluator")
-            outcome = await self.resume_evaluator.evaluate_program(candidate["code"], candidate["id"])
+            outcome = await self.resume_evaluator.evaluate_program(
+                candidate["code"], candidate["id"]
+            )
         else:
             assigned = resolution["outcome"]
             if assigned["kind"] == "accepted":
@@ -625,12 +762,17 @@ class ProcessParallelController:
             else:
                 outcome = CandidateRejected(
                     category=RejectionCategory(assigned["category"]),
-                    code=assigned["code"], rationale=assigned["rationale"],
-                    evidence=assigned["evidence"], repairable=assigned["repairable"],
+                    code=assigned["code"],
+                    rationale=assigned["rationale"],
+                    evidence=assigned["evidence"],
+                    repairable=assigned["repairable"],
                 )
         if isinstance(outcome, EvaluationNeedsAdjudication):
             self.adjudication_store.save_pending(
-                asdict(outcome), candidate, iteration, pending["checkpoint_path"],
+                asdict(outcome),
+                candidate,
+                iteration,
+                pending["checkpoint_path"],
                 replace_resolved=True,
             )
             raise AdjudicationRequired(outcome.request_id, self.output_dir)
@@ -640,28 +782,48 @@ class ProcessParallelController:
             retry_request["failure_message"], _ = sanitize_rejection_content(outcome.message, None)
             retry_request["allowed_dispositions"] = ["retry", "terminate"]
             self.adjudication_store.save_pending(
-                retry_request, candidate, iteration, pending["checkpoint_path"],
+                retry_request,
+                candidate,
+                iteration,
+                pending["checkpoint_path"],
                 replace_resolved=True,
             )
             raise MeasurementRetryRequired(request["request_id"], self.output_dir)
         if isinstance(outcome, RunFatalFailure):
-            raise RuntimeError(f"pending candidate measurement failed: {outcome.code}: {outcome.message}")
+            raise RuntimeError(
+                f"pending candidate measurement failed: {outcome.code}: {outcome.message}"
+            )
 
-        artifacts = self.resume_evaluator.get_pending_artifacts(candidate["id"]) if disposition == "retry" else None
+        parent = self.database.get(candidate["parent_id"])
+        if parent is None:
+            raise RuntimeError("pending candidate parent is missing from checkpoint")
+        artifacts = (
+            self.resume_evaluator.get_pending_artifacts(candidate["id"])
+            if disposition == "retry"
+            else None
+        )
         if isinstance(outcome, CandidateRejected):
             rationale, evidence = sanitize_rejection_content(
-                outcome.rationale, outcome.evidence,
+                outcome.rationale,
+                outcome.evidence,
                 max_rationale_bytes=self.config.rejection_memory.max_rationale_bytes,
                 max_evidence_bytes=self.config.rejection_memory.max_evidence_bytes,
             )
             attempt = RejectedAttempt(
-                attempt_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{request['request_id']}:{candidate['id']}")),
-                iteration=iteration, parent_id=candidate["parent_id"],
+                attempt_id=str(
+                    uuid.uuid5(uuid.NAMESPACE_URL, f"{request['request_id']}:{candidate['id']}")
+                ),
+                iteration=iteration,
+                parent_id=candidate["parent_id"],
                 inspiration_ids=tuple(candidate["inspiration_ids"]),
                 target_island=candidate["target_island"],
                 candidate_hash=candidate["candidate_hash"],
-                category=outcome.category, code=outcome.code, stage="adjudication",
-                rationale=rationale, evidence=evidence, repairable=outcome.repairable,
+                category=outcome.category,
+                code=outcome.code,
+                stage="adjudication",
+                rationale=rationale,
+                evidence=evidence,
+                repairable=outcome.repairable,
                 disposition=RejectionDisposition.DISCARDED,
                 config_fingerprint=digest_mapping(asdict(self.config.rejection_memory)),
                 prompt_digest=candidate.get("prompt_digest"),
@@ -670,16 +832,29 @@ class ProcessParallelController:
                 proposal_model=candidate.get("proposal_model"),
             )
             self.attempt_store.append(attempt)
+            if not self.rejection_policy.admit_rejected_program:
+                if self.database.get(candidate["id"]) is not None:
+                    raise RuntimeError("discarded candidate is already in ProgramDatabase")
+                # Record the measured iteration before checkpointing. The
+                # rejected candidate has no program-owned artifacts or lineage.
+                self.database.last_iteration = max(self.database.last_iteration, iteration)
+                if checkpoint_callback:
+                    checkpoint_callback(iteration)
+                self.adjudication_store.clear()
+                return iteration
             metrics = {"combined_score": self.config.rejection_memory.penalty_score}
             import json
             import os
 
             if os.environ.get("ENABLE_ARTIFACTS", "true").lower() == "true":
                 artifacts = dict(artifacts or {})
-                artifacts["rejection"] = json.dumps({
-                    "category": attempt.category.value, "code": attempt.code,
-                    "rationale": attempt.rationale,
-                })
+                artifacts["rejection"] = json.dumps(
+                    {
+                        "category": attempt.category.value,
+                        "code": attempt.code,
+                        "rationale": attempt.rationale,
+                    }
+                )
         elif isinstance(outcome, CandidateAccepted):
             metrics = dict(outcome.metrics)
             artifacts = dict(outcome.artifacts)
@@ -688,21 +863,44 @@ class ProcessParallelController:
         else:
             raise TypeError(f"unsupported adjudication result: {type(outcome)}")
 
-        parent = self.database.get(candidate["parent_id"])
-        if parent is None:
-            raise RuntimeError("pending candidate parent is missing from checkpoint")
         child = Program(
-            id=candidate["id"], code=candidate["code"],
+            id=candidate["id"],
+            code=candidate["code"],
             changes_description=candidate.get("changes_description") or "",
-            language=self.config.language, parent_id=parent.id,
-            generation=candidate["generation"], metrics=metrics,
+            language=self.config.language,
+            parent_id=parent.id,
+            generation=candidate["generation"],
+            metrics=metrics,
             iteration_found=iteration,
-            metadata={"changes": candidate["changes_summary"],
-                      "parent_metrics": parent.metrics, "island": candidate["parent_island"]},
+            metadata={
+                "changes": candidate["changes_summary"],
+                "parent_metrics": parent.metrics,
+                "island": candidate["parent_island"],
+            },
         )
         if self.database.get(child.id) is None:
-            self.database.add(child, iteration=iteration, target_island=candidate["target_island"])
-            if artifacts:
+            admitted_id = self.database.add(
+                child,
+                iteration=iteration,
+                target_island=candidate["target_island"],
+                admission=(
+                    ProgramAdmission.BASELINE_REJECTED
+                    if isinstance(outcome, CandidateRejected)
+                    else ProgramAdmission.ACCEPTED
+                ),
+            )
+            if admitted_id is None and self.database.get(child.id) is None:
+                self._record_novelty_rejection(
+                    child,
+                    iteration,
+                    candidate["target_island"],
+                    inspiration_ids=tuple(candidate["inspiration_ids"]),
+                    prompt_digest=candidate.get("prompt_digest"),
+                    response_digest=candidate.get("response_digest"),
+                    provider_usage=candidate.get("provider_usage"),
+                    proposal_model=candidate.get("proposal_model"),
+                )
+            elif artifacts:
                 self.database.store_artifacts(child.id, artifacts)
         if checkpoint_callback:
             checkpoint_callback(iteration)
@@ -885,6 +1083,31 @@ class ProcessParallelController:
         else:
             logger.info("Early stopping disabled")
 
+        def finish_iteration(iteration: int) -> None:
+            """Advance the proposal budget and refill one available island slot.
+
+            Args:
+                iteration: Completed proposal iteration, admitted or rejected.
+            """
+            nonlocal completed_iterations, next_iteration
+            completed_iterations += 1
+            for island_id, iteration_list in island_pending.items():
+                if iteration in iteration_list:
+                    iteration_list.remove(iteration)
+                    break
+            for island_id in range(self.num_islands):
+                if (
+                    len(island_pending[island_id]) < batch_per_island
+                    and next_iteration < total_iterations
+                    and not self.shutdown_event.is_set()
+                ):
+                    future = self._submit_iteration(next_iteration, island_id)
+                    if future:
+                        pending_futures[next_iteration] = future
+                        island_pending[island_id].append(next_iteration)
+                        next_iteration += 1
+                        break
+
         # Process results as they complete
         while (
             pending_futures
@@ -920,22 +1143,32 @@ class ProcessParallelController:
                         else "empty"
                     )
                 if result.outcome_type == "needs_adjudication":
-                    if result.pending_candidate_dict is None or result.operational_outcome_dict is None:
+                    if (
+                        result.pending_candidate_dict is None
+                        or result.operational_outcome_dict is None
+                    ):
                         raise ValueError("adjudication outcome lacks pending candidate identity")
                     if checkpoint_callback is None:
                         raise RuntimeError("adjudication requires a checkpoint callback")
                     checkpoint_iteration = self.database.last_iteration
                     checkpoint_callback(checkpoint_iteration)
-                    checkpoint_path = str(self.output_dir / "checkpoints" / f"checkpoint_{checkpoint_iteration}")
+                    checkpoint_path = str(
+                        self.output_dir / "checkpoints" / f"checkpoint_{checkpoint_iteration}"
+                    )
                     self.adjudication_store.save_pending(
-                        result.operational_outcome_dict, result.pending_candidate_dict,
-                        completed_iteration, checkpoint_path,
+                        result.operational_outcome_dict,
+                        result.pending_candidate_dict,
+                        completed_iteration,
+                        checkpoint_path,
                     )
                     raise AdjudicationRequired(
                         result.operational_outcome_dict["request_id"], self.output_dir
                     )
                 if result.outcome_type == "retryable_failure":
-                    if result.pending_candidate_dict is None or result.operational_outcome_dict is None:
+                    if (
+                        result.pending_candidate_dict is None
+                        or result.operational_outcome_dict is None
+                    ):
                         raise ValueError("retryable outcome lacks pending candidate identity")
                     if checkpoint_callback is None:
                         raise RuntimeError("retryable measurement requires a checkpoint callback")
@@ -951,7 +1184,8 @@ class ProcessParallelController:
                             "failure_message": detail["message"],
                             "allowed_dispositions": ["retry", "terminate"],
                         },
-                        result.pending_candidate_dict, completed_iteration,
+                        result.pending_candidate_dict,
+                        completed_iteration,
                         str(self.output_dir / "checkpoints" / f"checkpoint_{checkpoint_iteration}"),
                     )
                     raise MeasurementRetryRequired(request_id, self.output_dir)
@@ -963,14 +1197,35 @@ class ProcessParallelController:
                     )
                 if result.outcome_type not in {"accepted", "rejected", "failure", "empty"}:
                     raise ValueError(f"unknown worker outcome type: {result.outcome_type!r}")
-                if (result.outcome_type == "rejected") != (result.rejected_attempt_dict is not None):
-                    raise ValueError("rejected worker outcome must carry exactly one attempt record")
+                if (result.outcome_type == "rejected") != (
+                    result.rejected_attempt_dict is not None
+                ):
+                    raise ValueError(
+                        "rejected worker outcome must carry exactly one attempt record"
+                    )
 
                 if result.error:
                     raise RuntimeError(f"Iteration {completed_iteration} failed: {result.error}")
                 if result.rejected_attempt_dict is not None:
                     attempt = RejectedAttempt.from_dict(result.rejected_attempt_dict)
                     self.attempt_store.append(attempt)
+                    if not self.rejection_policy.admit_rejected_program:
+                        if result.child_program_dict is not None or result.artifacts:
+                            raise ValueError(
+                                "discarded rejection carried an insertable program or artifacts"
+                            )
+                    if result.child_program_dict is None:
+                        # Rejected proposals still consume an iteration and
+                        # must advance the resume checkpoint without a child.
+                        self.database.last_iteration = max(
+                            self.database.last_iteration, completed_iteration
+                        )
+                        if (
+                            completed_iteration > 0
+                            and completed_iteration % self.config.checkpoint_interval == 0
+                            and checkpoint_callback
+                        ):
+                            checkpoint_callback(completed_iteration)
                 if result.child_program_dict:
                     # Reconstruct program from dict
                     child_program = Program(**result.child_program_dict)
@@ -978,11 +1233,39 @@ class ProcessParallelController:
                     # Add to database with explicit target_island to ensure proper island placement
                     # This fixes issue #391: children should go to the target island, not inherit
                     # from the parent (which may be from a different island due to fallback sampling)
-                    self.database.add(
+                    admitted_id = self.database.add(
                         child_program,
                         iteration=completed_iteration,
                         target_island=result.target_island,
+                        admission=(
+                            ProgramAdmission.BASELINE_REJECTED
+                            if result.outcome_type == "rejected"
+                            else ProgramAdmission.ACCEPTED
+                        ),
                     )
+                    if admitted_id is None:
+                        self._record_novelty_rejection(
+                            child_program,
+                            completed_iteration,
+                            result.target_island,
+                            inspiration_ids=result.inspiration_ids,
+                            prompt_digest=(
+                                digest_text(result.prompt["system"] + "\n" + result.prompt["user"])
+                                if result.prompt
+                                else None
+                            ),
+                            response_digest=digest_text(result.llm_response),
+                            provider_usage=result.provider_usage,
+                            proposal_model=result.proposal_model,
+                        )
+                        if (
+                            completed_iteration > 0
+                            and completed_iteration % self.config.checkpoint_interval == 0
+                            and checkpoint_callback
+                        ):
+                            checkpoint_callback(completed_iteration)
+                        finish_iteration(completed_iteration)
+                        continue
 
                     # Store artifacts
                     if result.artifacts:
@@ -1172,30 +1455,12 @@ class ProcessParallelController:
             except AdjudicationRequired:
                 raise
             except Exception as e:
-                logger.exception(f"Error processing result from iteration {completed_iteration}: {e}")
+                logger.exception(
+                    f"Error processing result from iteration {completed_iteration}: {e}"
+                )
                 raise
 
-            completed_iterations += 1
-
-            # Remove completed iteration from island tracking
-            for island_id, iteration_list in island_pending.items():
-                if completed_iteration in iteration_list:
-                    iteration_list.remove(completed_iteration)
-                    break
-
-            # Submit next iterations maintaining island balance
-            for island_id in range(self.num_islands):
-                if (
-                    len(island_pending[island_id]) < batch_per_island
-                    and next_iteration < total_iterations
-                    and not self.shutdown_event.is_set()
-                ):
-                    future = self._submit_iteration(next_iteration, island_id)
-                    if future:
-                        pending_futures[next_iteration] = future
-                        island_pending[island_id].append(next_iteration)
-                        next_iteration += 1
-                        break  # Only submit one iteration per completion to maintain balance
+            finish_iteration(completed_iteration)
 
         # Handle shutdown
         if self.shutdown_event.is_set():

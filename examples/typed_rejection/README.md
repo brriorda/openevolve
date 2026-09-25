@@ -34,6 +34,15 @@ The test scripts one invalid-interface proposal, evaluates it with this
 example's evaluator, and checks the run-directory attempt ledger and baseline
 rejection artifact. It makes no provider calls.
 
+For categorical exclusion, run the separate one-iteration regression:
+
+```bash
+pytest -q tests/test_discard_only_smoke.py
+```
+
+It checks the durable attempt, the absence of a rejected child from selection
+and checkpoint state, and admission of an accepted zero-score control.
+
 ## Run evolution
 
 Set `OPENAI_API_KEY` for the configured OpenAI-compatible model, then run:
@@ -56,5 +65,10 @@ of prompt and response text. Raw prompts, responses, and candidate code do not
 enter that ledger.
 
 With the `artifact_low_score` policy, a rejected proposal still follows the
-existing low-score admission path and receives a `rejection` artifact. This
-example does not demonstrate a policy that excludes rejected proposals.
+existing low-score admission path and receives a `rejection` artifact. To run
+the same example with categorical exclusion, use
+`--config examples/typed_rejection/discard_only.yaml` and a distinct output
+directory. Only `rejection_memory.policy` differs between the two config files.
+Under `discard_only`, rejected proposals appear in the attempt ledger but do
+not become programs or program-owned artifacts. An accepted score of zero is
+still eligible for admission.
