@@ -89,3 +89,15 @@ global-history comparator. It shows recent eligible diagnoses with their source
 parent IDs, even if the selected parent differs. Both policies exclude rejected
 candidates from the program population. The model may or may not produce a
 rejection in eight iterations; use the attempt ledger to inspect what occurred.
+
+The four example configs share every resolved setting except
+`rejection_memory.policy`; this one field selects the baseline, discard-only,
+parent-next-once, or global-history behavior. Run the independent offline smoke
+test without TeamBench or a model provider:
+
+```bash
+pytest -q tests/test_parent_feedback_smoke.py
+```
+
+It checks one-shot delivery, parent isolation, global context, claim persistence,
+and the paired config invariant with scripted proposals.
