@@ -13,6 +13,7 @@ import asyncio
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 # Dummy API key so LLM ensembles initialize without a real key
@@ -95,6 +96,29 @@ class TestInitialProgramArtifacts(unittest.TestCase):
         self.assertIsNotNone(artifacts, "Initial program artifacts must be stored, not dropped")
         self.assertEqual(artifacts.get("stderr"), "initial-program-warning")
         self.assertEqual(artifacts.get("note"), "hello")
+
+    def test_rejected_initial_program_cannot_become_a_baseline_parent(self):
+        """Stop before mutation when the initial evaluator reports a hard rejection."""
+        Path(self.eval_file).write_text(
+            "from openevolve.rejection import reject_candidate\n"
+            "def evaluate(program_path):\n"
+            "    return reject_candidate(category='integrity_rejected', "
+            "code='benchmark_policy_violation', rationale='Invalid seed')\n",
+            encoding="utf-8",
+        )
+        controller = OpenEvolve(
+            initial_program_path=self.program_file,
+            evaluation_file=self.eval_file,
+            config=self._make_config(),
+            output_dir=os.path.join(self.test_dir, "out"),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "Initial program was rejected .*evolution requires an accepted initial program"
+        ):
+            asyncio.run(controller.run(iterations=1))
+
+        self.assertFalse(controller.database.programs)
 
     def test_no_artifacts_when_evaluator_returns_none(self):
         """When the evaluator returns no artifacts, nothing is stored (and no crash)."""
