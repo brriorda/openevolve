@@ -20,6 +20,7 @@ from openevolve.evolution_trace import EvolutionTracer
 from openevolve.llm.ensemble import LLMEnsemble
 from openevolve.process_parallel import ProcessParallelController
 from openevolve.prompt.sampler import PromptSampler
+from openevolve.rejection import CandidateRejected
 from openevolve.rejection_policy import validate_rejection_memory_config
 from openevolve.utils.code_utils import extract_code_language
 from openevolve.utils.format_utils import format_improvement_safe, format_metrics_safe
@@ -282,6 +283,14 @@ class OpenEvolve:
             initial_metrics = await self.evaluator.evaluate_program(
                 self.initial_program_code, initial_program_id
             )
+            if isinstance(initial_metrics, CandidateRejected):
+                # Search has no admitted parent from which to mutate. In particular, the baseline
+                # penalty policy must never turn an integrity-invalid seed into a selectable root.
+                raise ValueError(
+                    "Initial program was rejected "
+                    f"({initial_metrics.category.value}: {initial_metrics.code}); "
+                    "evolution requires an accepted initial program and no child iterations ran"
+                )
             if not isinstance(initial_metrics, dict):
                 raise ValueError(
                     "Initial program evaluation must return a metrics dictionary; "
