@@ -6,9 +6,9 @@ Example YAML::
       policy: artifact_low_score
       store: run_directory
 
-The ``artifact_low_score`` baseline and ``discard_only`` exclusion policy are
-implemented in this revision. Other arm values remain recognized, but preflight
-rejects them until their behavior is implemented.
+The baseline, discard-only, parent-next-once, and global-history policies are
+implemented in this revision. Other arm values remain recognized, but preflight rejects them
+until their behavior is implemented.
 """
 
 from __future__ import annotations
@@ -60,10 +60,16 @@ def resolve_rejection_policy(policy: str | RejectionPolicy) -> ResolvedRejection
         ValueError: The policy name is unknown.
     """
     selected = RejectionPolicy(policy)
-    if selected not in {RejectionPolicy.ARTIFACT_LOW_SCORE, RejectionPolicy.DISCARD_ONLY}:
+    if selected not in {
+        RejectionPolicy.ARTIFACT_LOW_SCORE,
+        RejectionPolicy.DISCARD_ONLY,
+        RejectionPolicy.PARENT_NEXT_ONCE,
+        RejectionPolicy.GLOBAL_HISTORY,
+    }:
         raise NotImplementedError(
             f"rejection_memory.policy={selected.value!r} is not implemented in this OpenEvolve "
-            "revision; use 'artifact_low_score', 'discard_only', or a revision that supports this policy"
+            "revision; use 'artifact_low_score', 'discard_only', 'parent_next_once', 'global_history', "
+            "or a revision that supports this policy"
         )
     return ResolvedRejectionPolicy(
         policy=selected,
@@ -71,8 +77,8 @@ def resolve_rejection_policy(policy: str | RejectionPolicy) -> ResolvedRejection
         admit_rejected_program=selected is RejectionPolicy.ARTIFACT_LOW_SCORE,
         attach_rejection_artifact=selected is RejectionPolicy.ARTIFACT_LOW_SCORE,
         immediate_repair=False,
-        deferred_parent_delivery=False,
-        global_delivery=False,
+        deferred_parent_delivery=selected is RejectionPolicy.PARENT_NEXT_ONCE,
+        global_delivery=selected is RejectionPolicy.GLOBAL_HISTORY,
     )
 
 
@@ -116,4 +122,12 @@ def validate_rejection_memory_config(config: object) -> ResolvedRejectionPolicy:
         raise ValueError("rejection_memory.repair_models must be a list of non-empty strings")
     if not isinstance(getattr(config, "repair_diff_based", None), bool):
         raise ValueError("rejection_memory.repair_diff_based must be a boolean")
-    return resolve_rejection_policy(getattr(config, "policy", None))
+    resolved = resolve_rejection_policy(getattr(config, "policy", None))
+    if resolved.deferred_parent_delivery:
+        if store != "run_directory":
+            raise ValueError("parent_next_once requires a durable run_directory attempt store")
+        if config.feedback_recent_k < 1:
+            raise ValueError("parent_next_once requires feedback_recent_k >= 1")
+    if resolved.global_delivery and config.feedback_recent_k < 1:
+        raise ValueError("global_history requires feedback_recent_k >= 1")
+    return resolved

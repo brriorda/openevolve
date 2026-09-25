@@ -19,7 +19,12 @@ from openevolve.adjudication import (
     AdjudicationStore,
     MeasurementRetryRequired,
 )
-from openevolve.attempt_store import AttemptStore, InMemoryAttemptStore, RunDirectoryAttemptStore
+from openevolve.attempt_store import (
+    AttemptStore,
+    FeedbackClaim,
+    InMemoryAttemptStore,
+    RunDirectoryAttemptStore,
+)
 from openevolve.database import Program, ProgramAdmission, ProgramDatabase
 from openevolve.rejection import (
     CandidateAccepted,
@@ -35,6 +40,7 @@ from openevolve.rejection import (
     sanitize_rejection_content,
 )
 from openevolve.rejection_policy import resolve_rejection_policy, validate_rejection_memory_config
+from openevolve.prompt.rejection_context import RejectedAttemptContextRenderer
 from openevolve.utils.metrics_utils import safe_numeric_average
 
 logger = logging.getLogger(__name__)
@@ -659,6 +665,8 @@ class ProcessParallelController:
             if config.rejection_memory.store == "in_memory"
             else RunDirectoryAttemptStore(output_dir or ".")
         )
+        self.feedback_context_renderer = RejectedAttemptContextRenderer(config.rejection_memory)
+        self._feedback_claims: dict[int, FeedbackClaim] = {}
 
         self.executor: Optional[ProcessPoolExecutor] = None
         self.shutdown_event = mp.Event()
@@ -680,7 +688,7 @@ class ProcessParallelController:
         response_digest: Optional[str] = None,
         provider_usage: Optional[Dict[str, int | float]] = None,
         proposal_model: Optional[str] = None,
-    ) -> None:
+    ) -> RejectedAttempt:
         """Record a novelty refusal as an attempt without admitting its program.
 
         Args:
@@ -692,6 +700,9 @@ class ProcessParallelController:
             response_digest: Hash of the proposal response, when available.
             provider_usage: Proposal-model usage counters.
             proposal_model: Proposal model name.
+
+        Returns:
+            Durable attempt representing the novelty refusal.
         """
         if self.database.get(child.id) is not None:
             raise RuntimeError("novelty-rejected candidate is already in ProgramDatabase")
@@ -723,6 +734,35 @@ class ProcessParallelController:
             proposal_model=proposal_model,
         )
         self.attempt_store.append(attempt)
+        return attempt
+
+    def _complete_feedback_claim(
+        self,
+        iteration: int,
+        outcome_id: str,
+        prompt_digest: Optional[str],
+        checkpoint_callback: Any,
+        *,
+        checkpoint_saved: bool = False,
+    ) -> None:
+        """Consume delivered feedback only after the proposal outcome is checkpointed.
+
+        Args:
+            iteration: Proposal iteration carrying the claim.
+            outcome_id: Durable admitted program or rejected-attempt ID.
+            prompt_digest: Digest of the exact proposal prompt when available.
+            checkpoint_callback: Run checkpoint writer.
+            checkpoint_saved: Whether the caller already wrote this outcome checkpoint.
+        """
+        claim = self._feedback_claims.get(iteration)
+        if claim is None:
+            return
+        if checkpoint_callback is None:
+            raise RuntimeError("parent feedback requires a checkpoint callback")
+        if not checkpoint_saved:
+            checkpoint_callback(iteration)
+        self.attempt_store.complete_claim(claim.claim_id, outcome_id, prompt_digest)
+        del self._feedback_claims[iteration]
 
     async def _resume_pending(self, checkpoint_callback: Any) -> Optional[int]:
         """Resolve or remeasure the saved candidate before submitting a new proposal.
@@ -746,7 +786,10 @@ class ProcessParallelController:
         resolution = pending["resolution"]
         disposition = resolution["disposition"]
         iteration = pending["iteration"]
+        feedback_claim_id = candidate.get("feedback_claim_id")
         if disposition == "terminate":
+            if feedback_claim_id:
+                self.attempt_store.release_claim(feedback_claim_id)
             self.adjudication_store.clear()
             self.request_shutdown()
             return iteration
@@ -841,6 +884,10 @@ class ProcessParallelController:
                 self.database.last_iteration = max(self.database.last_iteration, iteration)
                 if checkpoint_callback:
                     checkpoint_callback(iteration)
+                if feedback_claim_id:
+                    self.attempt_store.complete_claim(
+                        feedback_claim_id, attempt.attempt_id, candidate.get("prompt_digest")
+                    )
                 self.adjudication_store.clear()
                 return iteration
             metrics = {"combined_score": self.config.rejection_memory.penalty_score}
@@ -879,6 +926,7 @@ class ProcessParallelController:
                 "island": candidate["parent_island"],
             },
         )
+        outcome_id = child.id
         if self.database.get(child.id) is None:
             admitted_id = self.database.add(
                 child,
@@ -891,7 +939,7 @@ class ProcessParallelController:
                 ),
             )
             if admitted_id is None and self.database.get(child.id) is None:
-                self._record_novelty_rejection(
+                novelty_attempt = self._record_novelty_rejection(
                     child,
                     iteration,
                     candidate["target_island"],
@@ -901,10 +949,15 @@ class ProcessParallelController:
                     provider_usage=candidate.get("provider_usage"),
                     proposal_model=candidate.get("proposal_model"),
                 )
+                outcome_id = novelty_attempt.attempt_id
             elif artifacts:
                 self.database.store_artifacts(child.id, artifacts)
         if checkpoint_callback:
             checkpoint_callback(iteration)
+        if feedback_claim_id:
+            self.attempt_store.complete_claim(
+                feedback_claim_id, outcome_id, candidate.get("prompt_digest")
+            )
         self.adjudication_store.clear()
         return iteration
 
@@ -1030,6 +1083,8 @@ class ProcessParallelController:
         """Run evolution with process-based parallelism"""
         if not self.executor:
             raise RuntimeError("Process pool not started")
+        if self.rejection_policy.deferred_parent_delivery and checkpoint_callback is None:
+            raise RuntimeError("parent feedback requires a checkpoint callback")
 
         resumed_iteration = await self._resume_pending(checkpoint_callback)
         if self.shutdown_event.is_set():
@@ -1151,6 +1206,9 @@ class ProcessParallelController:
                         raise ValueError("adjudication outcome lacks pending candidate identity")
                     if checkpoint_callback is None:
                         raise RuntimeError("adjudication requires a checkpoint callback")
+                    claim = self._feedback_claims.get(completed_iteration)
+                    if claim is not None:
+                        result.pending_candidate_dict["feedback_claim_id"] = claim.claim_id
                     checkpoint_iteration = self.database.last_iteration
                     checkpoint_callback(checkpoint_iteration)
                     checkpoint_path = str(
@@ -1173,6 +1231,9 @@ class ProcessParallelController:
                         raise ValueError("retryable outcome lacks pending candidate identity")
                     if checkpoint_callback is None:
                         raise RuntimeError("retryable measurement requires a checkpoint callback")
+                    claim = self._feedback_claims.get(completed_iteration)
+                    if claim is not None:
+                        result.pending_candidate_dict["feedback_claim_id"] = claim.claim_id
                     checkpoint_iteration = self.database.last_iteration
                     checkpoint_callback(checkpoint_iteration)
                     detail = result.operational_outcome_dict
@@ -1207,6 +1268,8 @@ class ProcessParallelController:
 
                 if result.error:
                     raise RuntimeError(f"Iteration {completed_iteration} failed: {result.error}")
+                if result.outcome_type == "empty" and completed_iteration in self._feedback_claims:
+                    raise RuntimeError("claimed parent feedback produced no proposal outcome")
                 if result.rejected_attempt_dict is not None:
                     attempt = RejectedAttempt.from_dict(result.rejected_attempt_dict)
                     self.attempt_store.append(attempt)
@@ -1221,12 +1284,20 @@ class ProcessParallelController:
                         self.database.last_iteration = max(
                             self.database.last_iteration, completed_iteration
                         )
-                        if (
+                        checkpoint_saved = (
                             completed_iteration > 0
                             and completed_iteration % self.config.checkpoint_interval == 0
                             and checkpoint_callback
-                        ):
+                        )
+                        if checkpoint_saved:
                             checkpoint_callback(completed_iteration)
+                        self._complete_feedback_claim(
+                            completed_iteration,
+                            attempt.attempt_id,
+                            attempt.prompt_digest,
+                            checkpoint_callback,
+                            checkpoint_saved=bool(checkpoint_saved),
+                        )
                 if result.child_program_dict:
                     # Reconstruct program from dict
                     child_program = Program(**result.child_program_dict)
@@ -1245,7 +1316,7 @@ class ProcessParallelController:
                         ),
                     )
                     if admitted_id is None:
-                        self._record_novelty_rejection(
+                        novelty_attempt = self._record_novelty_rejection(
                             child_program,
                             completed_iteration,
                             result.target_island,
@@ -1259,12 +1330,20 @@ class ProcessParallelController:
                             provider_usage=result.provider_usage,
                             proposal_model=result.proposal_model,
                         )
-                        if (
+                        checkpoint_saved = (
                             completed_iteration > 0
                             and completed_iteration % self.config.checkpoint_interval == 0
                             and checkpoint_callback
-                        ):
+                        )
+                        if checkpoint_saved:
                             checkpoint_callback(completed_iteration)
+                        self._complete_feedback_claim(
+                            completed_iteration,
+                            novelty_attempt.attempt_id,
+                            novelty_attempt.prompt_digest,
+                            checkpoint_callback,
+                            checkpoint_saved=bool(checkpoint_saved),
+                        )
                         finish_iteration(completed_iteration)
                         continue
 
@@ -1377,6 +1456,21 @@ class ProcessParallelController:
                         if checkpoint_callback:
                             checkpoint_callback(completed_iteration)
 
+                    self._complete_feedback_claim(
+                        completed_iteration,
+                        child_program.id,
+                        (
+                            digest_text(result.prompt["system"] + "\n" + result.prompt["user"])
+                            if result.prompt
+                            else None
+                        ),
+                        checkpoint_callback,
+                        checkpoint_saved=(
+                            completed_iteration > 0
+                            and completed_iteration % self.config.checkpoint_interval == 0
+                        ),
+                    )
+
                     # Check target score
                     if target_score is not None and child_program.metrics:
                         if (
@@ -1463,11 +1557,17 @@ class ProcessParallelController:
 
             finish_iteration(completed_iteration)
 
+        # A proposal canceled before worker dispatch never received the
+        # diagnosis. Running proposals retain their durable reservations.
+        for iteration, future in pending_futures.items():
+            if future.cancel():
+                claim = self._feedback_claims.pop(iteration, None)
+                if claim is not None:
+                    self.attempt_store.release_claim(claim.claim_id)
+
         # Handle shutdown
         if self.shutdown_event.is_set():
             logger.info("Shutdown requested, canceling remaining evaluations...")
-            for future in pending_futures.values():
-                future.cancel()
 
         # Log completion reason
         if self.early_stopping_triggered:
@@ -1483,6 +1583,7 @@ class ProcessParallelController:
         self, iteration: int, island_id: Optional[int] = None
     ) -> Optional[Future]:
         """Submit an iteration to the process pool, optionally pinned to a specific island"""
+        claim: Optional[FeedbackClaim] = None
         try:
             # Use specified island or current island
             target_island = island_id if island_id is not None else self.database.current_island
@@ -1500,6 +1601,24 @@ class ProcessParallelController:
             # Create database snapshot
             db_snapshot = self._create_database_snapshot()
             db_snapshot["sampling_island"] = target_island  # Mark which island this is for
+            if self.rejection_policy.deferred_parent_delivery:
+                claim = self.attempt_store.claim_feedback(parent.id, f"iteration-{iteration}")
+                if claim is not None:
+                    attempt = self.attempt_store.get(claim.attempt_id)
+                    if attempt is None:
+                        raise RuntimeError("claimed parent feedback attempt is missing")
+                    context = self.feedback_context_renderer.render(parent.id, [attempt])
+                    if not context:
+                        raise RuntimeError("claimed parent feedback rendered no prompt context")
+                    db_snapshot["prompt_context"] = context
+            elif self.rejection_policy.global_delivery:
+                context = self.feedback_context_renderer.render_global(
+                    self.attempt_store.recent_feedback(
+                        limit=self.config.rejection_memory.feedback_recent_k
+                    )
+                )
+                if context:
+                    db_snapshot["prompt_context"] = context
 
             # Submit to process pool
             future = self.executor.submit(
@@ -1509,9 +1628,15 @@ class ProcessParallelController:
                 parent.id,
                 [insp.id for insp in inspirations],
             )
+            if claim is not None:
+                self._feedback_claims[iteration] = claim
 
             return future
 
         except Exception as e:
+            if claim is not None:
+                self.attempt_store.release_claim(claim.claim_id)
             logger.error(f"Error submitting iteration {iteration}: {e}")
+            if self.rejection_policy.deferred_parent_delivery:
+                raise
             return None

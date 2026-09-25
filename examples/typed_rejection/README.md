@@ -72,3 +72,20 @@ directory. Only `rejection_memory.policy` differs between the two config files.
 Under `discard_only`, rejected proposals appear in the attempt ledger but do
 not become programs or program-owned artifacts. An accepted score of zero is
 still eligible for admission.
+
+## Compare deferred feedback policies
+
+Use `--config examples/typed_rejection/parent_next_once.yaml` to deliver an
+eligible rejection diagnosis once to a later proposal selected from that same
+admitted parent. The run-directory store reserves an attempt before worker
+dispatch and writes its claim transition to
+`attempts/feedback_claims.jsonl`. The completion record names the outcome and
+prompt digest; it does not copy the full prompt or candidate code. The
+`generation_format_invalid`, `static_invalid`, and `runtime_candidate_failure`
+categories are eligible. Integrity, novelty, and operational failures are not.
+
+Use `--config examples/typed_rejection/global_history.yaml` for the bounded
+global-history comparator. It shows recent eligible diagnoses with their source
+parent IDs, even if the selected parent differs. Both policies exclude rejected
+candidates from the program population. The model may or may not produce a
+rejection in eight iterations; use the attempt ledger to inspect what occurred.

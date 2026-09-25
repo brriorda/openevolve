@@ -1,0 +1,35 @@
+# Bounded global rejection-history comparator for the typed rejection example.
+# From the OpenEvolve repository root after `pip install -e .`, run:
+#   python openevolve-run.py examples/typed_rejection/initial_program.py \
+#     examples/typed_rejection/evaluator.py \
+#     --config examples/typed_rejection/global_history.yaml --iterations 8 \
+#     --output typed_rejection_global_history_output
+# Recent diagnoses may come from other parents and are labeled with their
+# source parent ID. This arm does not make rejected programs selectable.
+
+max_iterations: 8
+checkpoint_interval: 4
+diff_based_evolution: true
+
+llm:
+  models:
+    - name: gpt-4o-mini
+      weight: 1.0
+
+prompt:
+  system_message: >
+    Improve the square(value) function so its numeric output is close to
+    value * value for positive and negative inputs. Preserve the required
+    top-level function name and one-argument interface.
+
+database:
+  num_islands: 1
+
+evaluator:
+  parallel_evaluations: 1
+
+rejection_memory:
+  policy: global_history
+  store: run_directory
+  feedback_recent_k: 1
+  penalty_score: 0.0
