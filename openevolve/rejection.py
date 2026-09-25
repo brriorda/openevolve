@@ -77,6 +77,35 @@ class RejectionDisposition(str, Enum):
     FEEDBACK_AVAILABLE = "feedback_available"
 
 
+_DEFERRED_FEEDBACK_CATEGORIES = frozenset(
+    {
+        RejectionCategory.GENERATION_FORMAT_INVALID,
+        RejectionCategory.STATIC_INVALID,
+        RejectionCategory.RUNTIME_CANDIDATE_FAILURE,
+    }
+)
+
+
+def eligible_for_deferred_feedback(attempt: "RejectedAttempt") -> bool:
+    """Allow candidate defects, while excluding integrity and policy refusals.
+
+    Args:
+        attempt: Typed rejection record considered for a later prompt.
+
+    Returns:
+        Whether the bounded diagnosis may be delivered to a proposal model.
+    """
+    return (
+        attempt.category in _DEFERRED_FEEDBACK_CATEGORIES
+        and attempt.disposition
+        in {
+            RejectionDisposition.DISCARDED,
+            RejectionDisposition.FEEDBACK_AVAILABLE,
+            RejectionDisposition.REPAIR_EXHAUSTED,
+        }
+    )
+
+
 def _bounded_text(value: str, *, max_bytes: int) -> str:
     """Normalize and UTF-8-bound free text, dropping control characters except whitespace."""
     if not isinstance(value, str):
