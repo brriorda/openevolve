@@ -6,8 +6,8 @@ Example YAML::
       policy: artifact_low_score
       store: run_directory
 
-Only the ``artifact_low_score`` baseline is implemented in this revision. Other
-arm values are recognized so configuration parsing remains stable, but preflight
+The ``artifact_low_score`` baseline and ``discard_only`` exclusion policy are
+implemented in this revision. Other arm values remain recognized, but preflight
 rejects them until their behavior is implemented.
 """
 
@@ -16,6 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import math
+
+from openevolve.rejection import RejectionCategory
 
 
 class RejectionPolicy(str, Enum):
@@ -33,9 +35,8 @@ class RejectionPolicy(str, Enum):
 class ResolvedRejectionPolicy:
     """Immutable internal feature matrix derived from one public policy value.
 
-    Use ``resolve_rejection_policy("artifact_low_score")`` to obtain the
-    supported ``artifact_low_score`` feature matrix; callers should not construct
-    it manually.
+    Use ``resolve_rejection_policy("discard_only")`` or another supported arm
+    to obtain the feature matrix; callers should not construct it manually.
     """
 
     policy: RejectionPolicy
@@ -45,6 +46,21 @@ class ResolvedRejectionPolicy:
     immediate_repair: bool
     deferred_parent_delivery: bool
     global_delivery: bool
+
+
+def admits_rejected_category(
+    policy: ResolvedRejectionPolicy, category: RejectionCategory
+) -> bool:
+    """Allow baseline admission except for explicit integrity violations.
+
+    Args:
+        policy: Resolved experimental policy.
+        category: Generic candidate rejection category.
+
+    Returns:
+        Whether a rejected child may become a low-score program.
+    """
+    return policy.admit_rejected_program and category is not RejectionCategory.INTEGRITY_REJECTED
 
 
 def resolve_rejection_policy(policy: str | RejectionPolicy) -> ResolvedRejectionPolicy:
@@ -61,16 +77,16 @@ def resolve_rejection_policy(policy: str | RejectionPolicy) -> ResolvedRejection
         ValueError: The policy name is unknown.
     """
     selected = RejectionPolicy(policy)
-    if selected is not RejectionPolicy.ARTIFACT_LOW_SCORE:
+    if selected not in {RejectionPolicy.ARTIFACT_LOW_SCORE, RejectionPolicy.DISCARD_ONLY}:
         raise NotImplementedError(
             f"rejection_memory.policy={selected.value!r} is not implemented in this OpenEvolve "
-            "revision; use 'artifact_low_score' or a revision that supports this policy"
+            "revision; use 'artifact_low_score', 'discard_only', or a revision that supports this policy"
         )
     return ResolvedRejectionPolicy(
         policy=selected,
         record_attempt=True,
-        admit_rejected_program=True,
-        attach_rejection_artifact=True,
+        admit_rejected_program=selected is RejectionPolicy.ARTIFACT_LOW_SCORE,
+        attach_rejection_artifact=selected is RejectionPolicy.ARTIFACT_LOW_SCORE,
         immediate_repair=False,
         deferred_parent_delivery=False,
         global_delivery=False,
