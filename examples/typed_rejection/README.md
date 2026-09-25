@@ -68,7 +68,8 @@ With the `artifact_low_score` policy, an ordinary rejected proposal still
 follows the existing low-score admission path. If the evaluator supplies its
 original metrics and artifacts, those are kept; otherwise the configured
 penalty and a `rejection` artifact are used. An `integrity_rejected` outcome is
-always recorded without admitting its candidate. To run
+always recorded without admitting its candidate, including after adjudication.
+To run
 the same example with categorical exclusion, use
 `--config examples/typed_rejection/discard_only.yaml` and a distinct output
 directory. Only `rejection_memory.policy` differs between the two config files.
@@ -103,4 +104,4 @@ pytest -q tests/test_parent_feedback_smoke.py
 ```
 
 It checks one-shot delivery, parent isolation, global context, claim persistence,
-and the paired config invariant with scripted proposals.
+hard integrity exclusion, and the paired config invariant with scripted proposals.
