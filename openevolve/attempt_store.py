@@ -111,6 +111,10 @@ class AttemptStore(Protocol):
         """Return recent attempts across parents for the global comparator."""
         ...
 
+    def recent_feedback(self, *, limit: int) -> list[RejectedAttempt]:
+        """Return the newest eligible feedback attempts across parents."""
+        ...
+
     def claim_feedback(self, parent_id: str, proposal_id: str) -> Optional[FeedbackClaim]:
         """Reserve one eligible parent attempt before proposal dispatch."""
         ...
@@ -183,6 +187,26 @@ class InMemoryAttemptStore:
             return (
                 [self._attempts[attempt_id] for attempt_id in self._order[-limit:]] if limit else []
             )
+
+    def recent_feedback(self, *, limit: int) -> list[RejectedAttempt]:
+        """Return up to ``limit`` eligible diagnostics, oldest first.
+
+        Args:
+            limit: Maximum number of eligible records to return.
+        """
+        if limit < 0:
+            raise ValueError("limit must be non-negative")
+        if limit == 0:
+            return []
+        with self._lock:
+            matches: list[RejectedAttempt] = []
+            for attempt_id in reversed(self._order):
+                attempt = self._attempts[attempt_id]
+                if eligible_for_deferred_feedback(attempt):
+                    matches.append(attempt)
+                    if len(matches) == limit:
+                        break
+            return list(reversed(matches))
 
     def _choose_claim(self, parent_id: str, proposal_id: str) -> Optional[FeedbackClaim]:
         """Select an unclaimed eligible attempt while the store lock is held."""
