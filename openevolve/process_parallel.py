@@ -39,7 +39,11 @@ from openevolve.rejection import (
     digest_text,
     sanitize_rejection_content,
 )
-from openevolve.rejection_policy import resolve_rejection_policy, validate_rejection_memory_config
+from openevolve.rejection_policy import (
+    admits_rejected_category,
+    resolve_rejection_policy,
+    validate_rejection_memory_config,
+)
 from openevolve.prompt.rejection_context import RejectedAttemptContextRenderer
 from openevolve.utils.metrics_utils import safe_numeric_average
 
@@ -502,9 +506,10 @@ def _run_iteration_worker(
                 proposal_model=proposal_model,
             )
             rejected_attempt_dict = rejected_attempt.to_dict()
-            if not resolve_rejection_policy(
-                _worker_config.rejection_memory.policy
-            ).admit_rejected_program:
+            if not admits_rejected_category(
+                resolve_rejection_policy(_worker_config.rejection_memory.policy),
+                rejected_attempt.category,
+            ):
                 # A discarded attempt has no Program or program-owned artifacts.
                 return SerializableResult(
                     parent_id=parent.id,
@@ -880,7 +885,7 @@ class ProcessParallelController:
                 proposal_model=candidate.get("proposal_model"),
             )
             self.attempt_store.append(attempt)
-            if not self.rejection_policy.admit_rejected_program:
+            if not admits_rejected_category(self.rejection_policy, attempt.category):
                 if self.database.get(candidate["id"]) is not None:
                     raise RuntimeError("discarded candidate is already in ProgramDatabase")
                 # Record the measured iteration before checkpointing. The

@@ -64,8 +64,11 @@ parent ID, category, code, rationale, proposal usage when available, and digests
 of prompt and response text. Raw prompts, responses, and candidate code do not
 enter that ledger.
 
-With the `artifact_low_score` policy, a rejected proposal still follows the
-existing low-score admission path and receives a `rejection` artifact. To run
+With the `artifact_low_score` policy, an ordinary rejected proposal still follows the
+existing low-score admission path and receives a `rejection` artifact. A typed
+`integrity_rejected` outcome is a hard exclusion under every policy: its attempt is
+recorded, but its candidate cannot become a selectable program, including after
+adjudication. To run
 the same example with categorical exclusion, use
 `--config examples/typed_rejection/discard_only.yaml` and a distinct output
 directory. Only `rejection_memory.policy` differs between the two config files.
@@ -100,4 +103,4 @@ pytest -q tests/test_parent_feedback_smoke.py
 ```
 
 It checks one-shot delivery, parent isolation, global context, claim persistence,
-and the paired config invariant with scripted proposals.
+hard integrity exclusion, and the paired config invariant with scripted proposals.

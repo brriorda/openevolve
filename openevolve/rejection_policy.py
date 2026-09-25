@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from enum import Enum
 import math
 
+from openevolve.rejection import RejectionCategory
+
 
 class RejectionPolicy(str, Enum):
     """Public rejection-memory arm selector."""
@@ -44,6 +46,21 @@ class ResolvedRejectionPolicy:
     immediate_repair: bool
     deferred_parent_delivery: bool
     global_delivery: bool
+
+
+def admits_rejected_category(
+    policy: ResolvedRejectionPolicy, category: RejectionCategory
+) -> bool:
+    """Admit a baseline rejection only when it is not a hard integrity violation.
+
+    Args:
+        policy: Resolved experimental arm.
+        category: Evaluator's typed rejection category.
+
+    Returns:
+        Whether the rejected candidate may become a low-score program.
+    """
+    return policy.admit_rejected_program and category is not RejectionCategory.INTEGRITY_REJECTED
 
 
 def resolve_rejection_policy(policy: str | RejectionPolicy) -> ResolvedRejectionPolicy:

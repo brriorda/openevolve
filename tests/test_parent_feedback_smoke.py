@@ -23,7 +23,14 @@ from openevolve.database import Program, ProgramDatabase
 from openevolve.evaluator import Evaluator
 from openevolve.process_parallel import ProcessParallelController
 from openevolve.prompt.sampler import PromptSampler
-from openevolve.rejection import RejectedAttempt, RejectionCategory, digest_text
+from openevolve.rejection import (
+    CandidateRejected,
+    RejectedAttempt,
+    RejectionCategory,
+    digest_text,
+    reject_candidate,
+)
+from openevolve.rejection_policy import admits_rejected_category, resolve_rejection_policy
 
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "typed_rejection"
@@ -49,6 +56,48 @@ def test_example_arms_vary_only_canonical_policy() -> None:
         assert value["rejection_memory"]["policy"] == policy
         value["rejection_memory"]["policy"] = "artifact_low_score"
         assert value == baseline
+
+
+def test_baseline_excludes_hard_integrity_rejection() -> None:
+    """Allow ordinary low-score observations while excluding integrity violations."""
+    baseline = resolve_rejection_policy("artifact_low_score")
+    assert admits_rejected_category(baseline, RejectionCategory.STATIC_INVALID)
+    assert not admits_rejected_category(baseline, RejectionCategory.INTEGRITY_REJECTED)
+
+
+def test_baseline_integrity_rejection_never_becomes_a_program(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep the attempt record while denying the candidate a selectable lineage.
+
+    Args:
+        tmp_path: Fresh run directory for durable attempts.
+        monkeypatch: Replaces the evaluator response and parent sampling.
+    """
+    controller, database, model = _configured_run(tmp_path, monkeypatch, "artifact_low_score")
+    seed = database.get("seed")
+    assert seed is not None
+    monkeypatch.setattr(database, "sample_from_island", lambda **_kwargs: (seed, []))
+    model.responses = [VALID_PROPOSALS[0]]
+
+    async def reject_integrity(_code: str, _candidate_id: str) -> CandidateRejected:
+        """Return the same typed outcome as a TeamBench integrity gate."""
+        return reject_candidate(
+            category="integrity_rejected",
+            code="benchmark_policy_violation",
+            rationale="Candidate breached the benchmark integrity boundary.",
+            repairable=False,
+        )
+
+    monkeypatch.setattr(process_parallel._worker_evaluator, "evaluate_program", reject_integrity)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        controller.executor = executor
+        asyncio.run(controller.run_evolution(start_iteration=1, max_iterations=1))
+
+    attempts = RunDirectoryAttemptStore(tmp_path).for_parent("seed", limit=10)
+    assert len(attempts) == 1
+    assert attempts[0].category is RejectionCategory.INTEGRITY_REJECTED
+    assert set(database.programs) == {"seed"}
 
 
 class ScriptedModel:
