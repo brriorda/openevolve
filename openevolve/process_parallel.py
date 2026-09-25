@@ -759,6 +759,8 @@ class ProcessParallelController:
             return
         if checkpoint_callback is None:
             raise RuntimeError("parent feedback requires a checkpoint callback")
+        if prompt_digest is None:
+            raise RuntimeError("delivered parent feedback requires a prompt digest")
         if not checkpoint_saved:
             checkpoint_callback(iteration)
         self.attempt_store.complete_claim(claim.claim_id, outcome_id, prompt_digest)
@@ -787,6 +789,8 @@ class ProcessParallelController:
         disposition = resolution["disposition"]
         iteration = pending["iteration"]
         feedback_claim_id = candidate.get("feedback_claim_id")
+        if feedback_claim_id and not candidate.get("prompt_digest"):
+            raise ValueError("pending parent feedback candidate lacks a prompt digest")
         if disposition == "terminate":
             if feedback_claim_id:
                 self.attempt_store.release_claim(feedback_claim_id)
@@ -1188,6 +1192,9 @@ class ProcessParallelController:
                 # Use evaluator timeout + buffer to gracefully handle stuck processes
                 timeout_seconds = self.config.evaluator.timeout + 30
                 result = future.result(timeout=timeout_seconds)
+                claim = self._feedback_claims.get(completed_iteration)
+                if claim is not None and result.parent_id != claim.parent_id:
+                    raise RuntimeError("worker result parent differs from claimed feedback parent")
 
                 if result.outcome_type == "legacy":
                     # Normalize older worker results at the controller boundary.
