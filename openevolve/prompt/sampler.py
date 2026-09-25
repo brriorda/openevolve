@@ -4,13 +4,12 @@ Prompt sampling for OpenEvolve
 
 import logging
 import random
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Union
 
 from openevolve.config import PromptConfig
+from openevolve.prompt.rejection_context import MAX_CONTEXT_BYTES
 from openevolve.prompt.templates import TemplateManager
-from openevolve.utils.format_utils import format_metrics_safe
 from openevolve.utils.metrics_utils import (
-    safe_numeric_average,
     get_fitness_score,
     format_feature_coordinates,
 )
@@ -63,6 +62,7 @@ class PromptSampler:
         program_artifacts: Optional[Dict[str, Union[str, bytes]]] = None,
         feature_dimensions: Optional[List[str]] = None,
         current_changes_description: Optional[str] = None,
+        prompt_context: str = "",
         **kwargs: Any,
     ) -> Dict[str, str]:
         """
@@ -80,6 +80,7 @@ class PromptSampler:
             diff_based_evolution: Whether to use diff-based evolution (True) or full rewrites (False)
             template_key: Optional override for template key
             program_artifacts: Optional artifacts from program evaluation
+            prompt_context: Separate, already bounded context supplied by a prompt-context provider
             **kwargs: Additional keys to replace in the user prompt
 
         Returns:
@@ -173,6 +174,15 @@ class PromptSampler:
                 user_message=user_message,
                 changes_description=current_changes_description.rstrip(),
             )
+
+        # Keep program-owned artifacts and attempt-owned context independent.
+        # Empty context leaves the existing prompt byte-for-byte unchanged.
+        if prompt_context:
+            if not isinstance(prompt_context, str):
+                raise TypeError("prompt_context must be a string")
+            if len(prompt_context.encode("utf-8")) > MAX_CONTEXT_BYTES:
+                raise ValueError("prompt_context exceeds the bounded prompt-context size")
+            user_message = f"{user_message}\n\n{prompt_context}"
 
         return {
             "system": system_message,
