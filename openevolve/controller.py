@@ -237,7 +237,8 @@ class OpenEvolve:
         Run the evolution process with improved parallel processing
 
         Args:
-            iterations: Maximum number of iterations (uses config if None)
+            iterations: Total child-iteration target, including iterations in a checkpoint
+                (uses config if None)
             target_score: Target score to reach (continues until reached if specified)
             checkpoint_path: Path to resume from checkpoint
 
@@ -264,7 +265,7 @@ class OpenEvolve:
             start_iteration = self.database.last_iteration + 1
             logger.info(f"Resuming from checkpoint at iteration {start_iteration}")
         else:
-            start_iteration = self.database.last_iteration
+            start_iteration = self.database.last_iteration + bool(self.database.programs)
 
         # Only add initial program if starting fresh (not resuming from checkpoint)
         should_add_initial = (
@@ -336,52 +337,53 @@ class OpenEvolve:
                 f"with {len(self.database.programs)} existing programs)"
             )
 
-        # Initialize improved parallel processing
+        # Iteration 0 is the seed. A resumed run keeps the original total child
+        # budget, so only iterations not represented by the checkpoint may run.
+        evolution_start = max(1, start_iteration)
+        evolution_iterations = max(0, max_iterations - evolution_start + 1)
+        if (
+            pending_adjudication is not None
+            and max_iterations > 0
+            and pending_adjudication["iteration"] > max_iterations
+        ):
+            raise ValueError("pending adjudication exceeds the child-iteration target")
+
+        # Initialize improved parallel processing only when children remain.
         try:
-            self.parallel_controller = ProcessParallelController(
-                self.config,
-                self.evaluation_file,
-                self.database,
-                self.evolution_tracer,
-                file_suffix=self.config.file_suffix,
-                output_dir=self.output_dir,
-                evaluator=self.evaluator,
-            )
+            if evolution_iterations or pending_adjudication is not None:
+                self.parallel_controller = ProcessParallelController(
+                    self.config,
+                    self.evaluation_file,
+                    self.database,
+                    self.evolution_tracer,
+                    file_suffix=self.config.file_suffix,
+                    output_dir=self.output_dir,
+                    evaluator=self.evaluator,
+                )
 
-            # Set up signal handlers for graceful shutdown
-            def signal_handler(signum, frame):
-                logger.info(f"Received signal {signum}, initiating graceful shutdown...")
-                self.parallel_controller.request_shutdown()
+                # Set up signal handlers for graceful shutdown
+                def signal_handler(signum, frame):
+                    logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+                    self.parallel_controller.request_shutdown()
 
-                # Set up a secondary handler for immediate exit if user presses Ctrl+C again
-                def force_exit_handler(signum, frame):
-                    logger.info("Force exit requested - terminating immediately")
-                    import sys
+                    # Set up a secondary handler for immediate exit if user presses Ctrl+C again
+                    def force_exit_handler(signum, frame):
+                        logger.info("Force exit requested - terminating immediately")
+                        import sys
 
-                    sys.exit(0)
+                        sys.exit(0)
 
-                signal.signal(signal.SIGINT, force_exit_handler)
+                    signal.signal(signal.SIGINT, force_exit_handler)
 
-            signal.signal(signal.SIGINT, signal_handler)
-            signal.signal(signal.SIGTERM, signal_handler)
+                signal.signal(signal.SIGINT, signal_handler)
+                signal.signal(signal.SIGTERM, signal_handler)
 
-            self.parallel_controller.start()
-
-            # When starting from iteration 0, we've already done the initial program evaluation
-            # So we need to adjust the start_iteration for the actual evolution
-            evolution_start = start_iteration
-            evolution_iterations = max_iterations
-
-            # If we just added the initial program at iteration 0, start evolution from iteration 1
-            if should_add_initial and start_iteration == 0:
-                evolution_start = 1
-                # User expects max_iterations evolutionary iterations AFTER the initial program
-                # So we don't need to reduce evolution_iterations
-
-            # Run evolution with improved parallel processing and checkpoint callback
-            await self._run_evolution_with_checkpoints(
-                evolution_start, evolution_iterations, target_score
-            )
+                self.parallel_controller.start()
+                await self._run_evolution_with_checkpoints(
+                    evolution_start, evolution_iterations, target_score
+                )
+            else:
+                logger.info(f"Child-iteration target {max_iterations} already reached")
 
         finally:
             # Clean up parallel processing resources

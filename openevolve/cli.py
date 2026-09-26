@@ -30,7 +30,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", "-o", help="Output directory for results", default=None)
 
     parser.add_argument(
-        "--iterations", "-i", help="Maximum number of iterations", type=int, default=None
+        "--iterations",
+        "-i",
+        help="Total child-iteration target, including checkpoint progress",
+        type=int,
+        default=None,
     )
 
     parser.add_argument(
