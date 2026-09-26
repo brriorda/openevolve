@@ -57,7 +57,8 @@ def run_evolution(
             - Path to config YAML file (str or Path)
             - Config object
             - None for defaults
-        iterations: Number of iterations (overrides config)
+        iterations: Total number of child iterations, including those already in a
+            resumed checkpoint (overrides config)
         output_dir: Output directory (None for temp directory)
         cleanup: If True, clean up temp files after evolution
 

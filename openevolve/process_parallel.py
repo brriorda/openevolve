@@ -1095,11 +1095,15 @@ class ProcessParallelController:
         if self.rejection_policy.deferred_parent_delivery and checkpoint_callback is None:
             raise RuntimeError("parent feedback requires a checkpoint callback")
 
+        # A resolved pending candidate consumes its original iteration. Preserve
+        # the caller's final iteration when advancing past that saved candidate.
+        final_iteration = start_iteration + max_iterations - 1
         resumed_iteration = await self._resume_pending(checkpoint_callback)
         if self.shutdown_event.is_set():
             return self.database.get_best_program()
         if resumed_iteration is not None:
             start_iteration = max(start_iteration, resumed_iteration + 1)
+            max_iterations = max(0, final_iteration - start_iteration + 1)
         total_iterations = start_iteration + max_iterations
 
         logger.info(

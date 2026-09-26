@@ -79,9 +79,9 @@ def evaluate(program_path):
         self.assertEqual(expected_checkpoints, [10, 20], "Checkpoints should be at 10 and 20")
 
     def test_resume_iteration_counting(self):
-        """Test that resume correctly continues from checkpoint"""
+        """Test that resume treats the configured limit as a total child target"""
         config = Config()
-        config.max_iterations = 10
+        config.max_iterations = 20
         config.checkpoint_interval = 10
 
         # Simulate resume from checkpoint 10
@@ -90,14 +90,14 @@ def evaluate(program_path):
 
         # Apply the logic
         evolution_start = start_iteration
-        evolution_iterations = config.max_iterations
+        evolution_iterations = max(0, config.max_iterations - evolution_start + 1)
 
         if should_add_initial and start_iteration == 0:
             evolution_start = 1
 
         # Verify
         self.assertEqual(evolution_start, 11, "Evolution should continue from iteration 11")
-        self.assertEqual(evolution_iterations, 10, "Should run 10 more iterations")
+        self.assertEqual(evolution_iterations, 10, "Should run only the remaining 10 iterations")
 
         # Total iterations
         total_iterations = evolution_start + evolution_iterations
