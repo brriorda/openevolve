@@ -92,6 +92,10 @@ python openevolve-run.py examples/function_minimization/initial_program.py \
 
 **Note:** The example config uses Gemini by default, but you can use any OpenAI-compatible provider by modifying the `config.yaml`. See the [configs](configs/) for full configuration options.
 
+When resuming from a checkpoint, `--iterations` remains the total child-iteration
+target. A checkpoint at iteration 3 with `--iterations 24` schedules children
+4 through 24, rather than 24 additional children.
+
 ### **Library Usage**
 
 OpenEvolve can be used as a library without any external files:

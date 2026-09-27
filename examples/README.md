@@ -209,6 +209,9 @@ python openevolve-run.py path/to/initial_program.py path/to/evaluator.py \
 python scripts/visualizer.py --path path/to/openevolve_output/checkpoints/checkpoint_100/
 ```
 
+On resume, `--iterations 50` sets the total child-iteration target to 50. For
+example, a checkpoint at iteration 20 runs children 21 through 50.
+
 ## Advanced Configuration Options
 
 ### LLM Ensemble (Multiple Models)
