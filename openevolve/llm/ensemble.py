@@ -83,6 +83,26 @@ class LLMEnsemble:
         model = self._sample_model()
         return await model.generate_with_context(system_message, messages, **kwargs)
 
+    async def generate_with_receipt(
+        self, system_message: str, messages: List[Dict[str, str]], **kwargs
+    ) -> tuple[str, dict[str, int | float], str]:
+        """Generate once and collect accounting for the sampled proposal model.
+
+        Args:
+            system_message: System instruction sent to the selected backend.
+            messages: Conversation messages used to generate the proposal.
+            **kwargs: Provider-specific generation options.
+
+        Returns:
+            Response text, available usage counters, and selected model name.
+            ``proposal_calls`` is recorded even when the backend omits token usage.
+        """
+        model = self._sample_model()
+        response = await model.generate_with_context(system_message, messages, **kwargs)
+        usage = dict(getattr(model, "last_usage", {}) or {})
+        usage["proposal_calls"] = int(getattr(model, "last_call_attempts", 1))
+        return response, usage, str(getattr(model, "model", "unknown"))
+
     def _sample_model(self) -> LLMInterface:
         """Sample a model from the ensemble based on weights"""
         index = self.random_state.choices(range(len(self.models)), weights=self.weights, k=1)[0]

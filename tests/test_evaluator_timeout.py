@@ -11,6 +11,7 @@ from unittest.mock import patch, MagicMock
 
 from openevolve.config import EvaluatorConfig
 from openevolve.evaluator import Evaluator
+from openevolve.rejection import EvaluationRetryableFailure
 
 
 class TestEvaluatorTimeout(unittest.TestCase):
@@ -161,11 +162,9 @@ def evaluate_stage3(program_path):
             self.assertGreater(elapsed_time, 2.5)
             self.assertLess(elapsed_time, 5)
 
-            # Should return timeout result
-            self.assertIn("error", result)
-            self.assertEqual(result["error"], 0.0)
-            self.assertIn("timeout", result)
-            self.assertTrue(result["timeout"])
+            # Operational timeout must not be scored as a candidate result.
+            self.assertIsInstance(result, EvaluationRetryableFailure)
+            self.assertEqual(result.code, "evaluation_timeout")
 
         asyncio.run(run_test())
 
@@ -185,11 +184,8 @@ def evaluate_stage3(program_path):
             self.assertGreater(elapsed_time, 2.5)
             self.assertLess(elapsed_time, 5)
 
-            # Should return stage1 timeout result
-            self.assertIn("stage1_passed", result)
-            self.assertEqual(result["stage1_passed"], 0.0)
-            self.assertIn("timeout", result)
-            self.assertTrue(result["timeout"])
+            self.assertIsInstance(result, EvaluationRetryableFailure)
+            self.assertEqual(result.code, "stage1_timeout")
 
         asyncio.run(run_test())
 
@@ -209,13 +205,8 @@ def evaluate_stage3(program_path):
             self.assertGreater(elapsed_time, 2.5)
             self.assertLess(elapsed_time, 5)
 
-            # Should have stage1 result but stage2 timeout
-            self.assertIn("stage1_score", result)
-            self.assertEqual(result["stage1_score"], 0.7)
-            self.assertIn("stage2_passed", result)
-            self.assertEqual(result["stage2_passed"], 0.0)
-            self.assertIn("timeout", result)
-            self.assertTrue(result["timeout"])
+            self.assertIsInstance(result, EvaluationRetryableFailure)
+            self.assertEqual(result.code, "stage2_timeout")
 
         asyncio.run(run_test())
 
@@ -235,15 +226,8 @@ def evaluate_stage3(program_path):
             self.assertGreater(elapsed_time, 2.5)
             self.assertLess(elapsed_time, 5)
 
-            # Should have stage1 and stage2 results but stage3 timeout
-            self.assertIn("stage1_score", result)
-            self.assertEqual(result["stage1_score"], 0.7)
-            self.assertIn("stage2_score", result)
-            self.assertEqual(result["stage2_score"], 0.8)
-            self.assertIn("stage3_passed", result)
-            self.assertEqual(result["stage3_passed"], 0.0)
-            self.assertIn("timeout", result)
-            self.assertTrue(result["timeout"])
+            self.assertIsInstance(result, EvaluationRetryableFailure)
+            self.assertEqual(result.code, "stage3_timeout")
 
         asyncio.run(run_test())
 
@@ -265,9 +249,8 @@ def evaluate_stage3(program_path):
             self.assertGreater(elapsed_time, 4.5)
             self.assertLess(elapsed_time, 7)
 
-            # Should return timeout result
-            self.assertIn("timeout", result)
-            self.assertTrue(result["timeout"])
+            self.assertIsInstance(result, EvaluationRetryableFailure)
+            self.assertEqual(result.code, "evaluation_timeout")
 
         asyncio.run(run_test())
 
@@ -302,9 +285,8 @@ def evaluate_stage3(program_path):
             self.assertGreater(elapsed_time, 1.8)  # At least 2 sleep periods
             self.assertLess(elapsed_time, 4)  # But not too long
 
-            # Should return error result after all retries fail
-            self.assertIn("error", result)
-            self.assertEqual(result["error"], 0.0)
+            self.assertIsInstance(result, EvaluationRetryableFailure)
+            self.assertEqual(result.code, "evaluation_exception")
 
         asyncio.run(run_test())
 
@@ -338,9 +320,8 @@ def evaluate_stage3(program_path):
             self.assertGreater(elapsed_time, 1.8)  # At least the timeout period
             self.assertLess(elapsed_time, 3.5)  # But not multiple timeout periods
 
-            # Should return timeout result
-            self.assertIn("timeout", result)
-            self.assertTrue(result["timeout"])
+            self.assertIsInstance(result, EvaluationRetryableFailure)
+            self.assertEqual(result.code, "evaluation_timeout")
 
         asyncio.run(run_test())
 
@@ -356,9 +337,8 @@ def evaluate_stage3(program_path):
                 # Execute evaluation
                 result = await evaluator.evaluate_program(program_code, "test_artifacts")
 
-                # Verify timeout occurred
-                self.assertIn("timeout", result, "Result should contain timeout flag")
-                self.assertTrue(result["timeout"], "Timeout flag should be True")
+                self.assertIsInstance(result, EvaluationRetryableFailure)
+                self.assertEqual(result.code, "evaluation_timeout")
 
                 # Verify artifacts were captured
                 artifacts = evaluator.get_pending_artifacts("test_artifacts")
@@ -385,7 +365,6 @@ def evaluate_stage3(program_path):
                     artifacts["timeout_duration"], 3, "timeout_duration should match config"
                 )
 
-                print(f"✅ Artifacts captured correctly: {list(artifacts.keys())}")
 
         asyncio.run(run_test())
 
@@ -442,10 +421,8 @@ def search_algorithm():
                 self.assertLess(elapsed_time, 5)
                 self.assertGreater(elapsed_time, 2.5)
 
-                # Should return timeout error
-                self.assertIn("error", result)
-                self.assertIn("timeout", result)
-                self.assertTrue(result["timeout"])
+                self.assertIsInstance(result, EvaluationRetryableFailure)
+                self.assertEqual(result.code, "evaluation_timeout")
 
             finally:
                 if os.path.exists(test_eval_file.name):
