@@ -749,9 +749,11 @@ return EvaluationResult(
 ### Explicit candidate rejection
 
 An evaluator may return a typed candidate rejection when it has evidence that a proposal violates a
-candidate-level requirement. This creates a separate bounded attempt record; in this initial release,
-the default `artifact_low_score` policy still keeps the candidate in the population with the configured
+candidate-level requirement. This creates a separate bounded attempt record. The default
+`artifact_low_score` policy keeps the candidate in the population with the configured
 `rejection_memory.penalty_score` (default `0.0`) and a rejection artifact for compatibility.
+The `discard_only` policy records the attempt without admitting the candidate or attaching
+program-owned artifacts.
 Provider outages, timeouts, and unresolved measurements are operational failures,
 not candidate rejection reasons.
 
@@ -769,7 +771,7 @@ def evaluate(program_path):
     return {"combined_score": run_benchmark(program_path)}
 ```
 
-The current supported policy is `artifact_low_score`. Other declared experiment policies fail during
+The supported policies are `artifact_low_score` and `discard_only`. Other declared policies fail during
 preflight until their implementation is installed. The attempt ledger is written to
 `<output_dir>/attempts/rejected_attempts.jsonl` with bounded, allow-listed fields. The ledger records
 the selected proposal model and provider-reported token usage when available. An initial seed must
